@@ -790,8 +790,8 @@ def mainLTXDirector(
         # --- Step 11: Pass-through (replaces LTXDirectorGuide #133) ---
         # The original LTXDirectorGuide applied per-segment guidance and downscaling.
         # Without the Director timeline, we pass conditioning and latent through directly.
-        # The downscale_factor=0.5 behavior is not needed since the latent is already
-        # at the target resolution and LTXVLatentUpsampler handles upscaling between passes.
+        # The half-resolution latent created in Step 8c provides the coarse-to-fine
+        # strategy that the original downscale_factor=0.5 achieved.
         pass1_positive = get_value_at_index(ltxvconditioning_10, 0)
         pass1_negative = get_value_at_index(ltxvconditioning_10, 1)
         pass1_latent = pipeline_video_latent
