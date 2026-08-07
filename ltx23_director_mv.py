@@ -107,6 +107,12 @@ def model_download(url: str, dest_dir: str, filename: str = None, silent: bool =
         if filename is None:
             filename = url.split("/")[-1].split("?")[0]
 
+        # Skip if already downloaded
+        full_path = os.path.join(dest_dir, filename)
+        if os.path.exists(full_path) and os.path.getsize(full_path) > 0:
+            print(f"{filename} already exists, skipping download.")
+            return filename
+
         cmd = [
             "aria2c",
             "--console-log-level=error",
@@ -129,8 +135,10 @@ def model_download(url: str, dest_dir: str, filename: str = None, silent: bool =
         return filename
 
     except subprocess.CalledProcessError as e:
-        error = e.stderr.strip() or "Unknown error"
-        print(f"\nError downloading {filename}: {error}")
+        error = e.stderr.strip() if e.stderr else ""
+        output = e.stdout.strip() if e.stdout else ""
+        detail = error or output or "Unknown error (possible 404 or network issue)"
+        print(f"\nError downloading {filename}: {detail}")
         return False
     except Exception as e:
         print(f"\nError: {str(e)}")
@@ -203,7 +211,7 @@ from nodes import NODE_CLASS_MAPPINGS
 # ============================================================
 
 # GGUF UNet model
-ltx_model_url = "https://huggingface.co/Kijai/LTXV2_comfy/resolve/main/diffusion_models/ltx-2-3-22b-dev-Q4_K_M.gguf"
+ltx_model_url = "https://huggingface.co/city96/LTX-Video-2-GGUF/resolve/main/ltx-2-3-22b-dev-Q4_K_M.gguf"
 dit_model = model_download(ltx_model_url, "/content/ComfyUI/models/unet")
 if not dit_model:
     raise RuntimeError("Failed to download UNet GGUF model, aborting pipeline")
@@ -214,7 +222,7 @@ text_encoder1_model = model_download(text_encoder1_url, "/content/ComfyUI/models
 if not text_encoder1_model:
     raise RuntimeError("Failed to download text encoder 1, aborting pipeline")
 
-text_encoder2_url = "https://huggingface.co/Kijai/LTXV2_comfy/resolve/main/text_encoders/ltx-2.3_text_projection_bf16.safetensors"
+text_encoder2_url = "https://huggingface.co/Kijai/LTXV2_comfy/resolve/main/text_encoders/ltx-2.3-22b-embeddings_connector_bf16.safetensors"
 text_encoder2_model = model_download(text_encoder2_url, "/content/ComfyUI/models/text_encoders")
 if not text_encoder2_model:
     raise RuntimeError("Failed to download text encoder 2, aborting pipeline")
