@@ -1,0 +1,27 @@
+{
+  "id": "FEAT-003",
+  "type": "fix",
+  "description": "Address v2 review issues: fix LTXDirector timeline data delivery to use a serialized JSON blob (timeline_data) instead of invented kwargs, matching the workflow JSON's widgets_values[6] structure",
+  "status": "completed",
+  "steps": [
+    "Add build_timeline_data() helper function that constructs the timeline JSON blob from user inputs (image_paths, audio_path, audio_trim_start, global_prompt, frames)",
+    "Replace invented kwargs (image_paths, audio_path, audio_trim_start, normalDurationFrames) in LTXDirector EXECUTE_NORMALIZED call with proper widget parameters: timeline_data, local_prompts, segment_lengths, epsilon, guide_strength, mainTrackEnabled, audioTrackEnabled, motionTrackEnabled, frame_rate, custom_width, custom_height, resize_method, divisible_by, img_compression",
+    "Keep global_prompt as a named STRING input (node input slot 4) since it is accepted as both a linked input and a property",
+    "Add import json at top-level imports",
+    "Add comprehensive TODO comments explaining the approach and that parameter names are derived from workflow JSON analysis"
+  ],
+  "acceptance_criteria": [
+    "LTXDirector call no longer uses invented kwargs (image_paths, audio_path, audio_trim_start, normalDurationFrames)",
+    "LTXDirector call passes timeline_data as a serialized JSON string parameter",
+    "build_timeline_data() constructs segments and audioSegments matching the workflow JSON schema",
+    "Widget parameters (frame_rate, custom_width, custom_height, etc.) are passed as named kwargs",
+    "segment_lengths, guide_strength, and local_prompts are computed and passed as comma-separated strings",
+    "File still passes AST syntax validation",
+    "Power Lora Loader TODO comment is still present (issue 2 from v2 review acknowledged)"
+  ],
+  "verification": [
+    "python3 -c \"import ast; content = open('ltx23_director_mv_30s.py').read(); lines = content.split('\\n'); clean = '\\n'.join(['# '+l if l.strip().startswith('!') or l.strip().startswith('# %cd') else l for l in lines]); ast.parse(clean); print('OK')\""
+  ],
+  "blocked_reason": null,
+  "findings": "The LTXDirector node's EXECUTE_NORMALIZED signature cannot be verified without the actual whatdreamscost-comfyui source code. The parameter names used (timeline_data, local_prompts, segment_lengths, epsilon, guide_strength, mainTrackEnabled, audioTrackEnabled, motionTrackEnabled, frame_rate, custom_width, custom_height, resize_method, divisible_by, img_compression) are derived from the node's 'properties' dict in the workflow JSON. ComfyUI's EXECUTE_NORMALIZED typically maps property names to kwargs. If the node uses different internal parameter names, the TODO comment directs users to inspect the source. Issue 2 (Power Lora Loader API) remains acknowledged via existing TODO comment."
+}

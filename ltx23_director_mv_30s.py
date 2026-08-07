@@ -81,6 +81,7 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 import sys
 from pathlib import Path
 import random
+import json
 from typing import Sequence, Mapping, Any, Union
 import torch
 
@@ -369,6 +370,91 @@ def upload_multiple_images(count=5):
         print(f"Image saved to: {dest_path}")
 
     return paths
+
+
+def build_timeline_data(image_paths, audio_path, audio_trim_start, global_prompt, frames):
+    """Construct the timeline_data JSON blob that the LTXDirector node expects.
+
+    The LTXDirector node in ComfyUI receives its entire timeline configuration
+    (image segments, audio segments, global prompt, retake config) through a single
+    serialized JSON string parameter called 'timeline_data'. This function builds
+    that blob programmatically from user-provided inputs, matching the exact schema
+    observed in the workflow JSON (widgets_values[6] of node 131).
+
+    The image segments are distributed evenly across the total frame count unless
+    only one image is provided (which gets the full duration). Audio segments span
+    the full video length with the user-specified trim offset.
+
+    TODO: The exact field requirements may vary between versions of whatdreamscost-comfyui.
+    If the node rejects this blob or ignores certain fields, inspect the node's source
+    code at custom_nodes/whatdreamscost-comfyui/ for the expected schema.
+    """
+    import time
+
+    segments = []
+    num_images = len(image_paths) if image_paths else 0
+
+    if num_images > 0:
+        # Distribute frames evenly across image segments
+        segment_length = frames / num_images
+        for i, img_path in enumerate(image_paths):
+            # Extract relative path for ComfyUI input directory format
+            # Image files are stored at /content/ComfyUI/input/whatdreamscost/<name>
+            img_filename = os.path.basename(img_path)
+            image_file = f"whatdreamscost/{img_filename}"
+            seg_id = f"{int(time.time() * 1000)}{i}seg"
+            segments.append({
+                "id": seg_id,
+                "start": i * segment_length,
+                "length": segment_length,
+                "prompt": "",
+                "type": "image",
+                "imageFile": image_file,
+                "imageB64": f"/api/view?filename={img_filename}&type=input&subfolder=whatdreamscost",
+                "isEndFrame": False,
+            })
+
+    audio_segments = []
+    if audio_path:
+        audio_filename = os.path.basename(audio_path)
+        audio_file = f"whatdreamscost/{audio_filename}"
+        audio_segments.append({
+            "id": f"{int(time.time() * 1000)}aud",
+            "type": "audio",
+            "start": 0,
+            "length": frames + 0.5,  # Slightly longer than video to avoid trimming
+            "trimStart": float(audio_trim_start),
+            "audioDurationFrames": 2880,  # Default; node computes actual from file
+            "audioFile": audio_file,
+            "fileName": audio_filename,
+            "waveformPeaks": [],  # Not required for execution; UI-only field
+        })
+
+    timeline = {
+        "mainTrackEnabled": True,
+        "audioTrackEnabled": bool(audio_path),
+        "motionTrackEnabled": True,
+        "propHeight": 90,
+        "globalPropHeight": 470,
+        "showFilenames": True,
+        "overrideAudio": False,
+        "inpaint_audio": True,
+        "global_prompt": global_prompt,
+        "retake_global_prompt": "",
+        "retakeMode": False,
+        "retakeStart": 24,
+        "retakeLength": 48,
+        "retakePrompt": "",
+        "retakeStrength": 1,
+        "retakeVideo": None,
+        "normalStartFrame": 0,
+        "normalDurationFrames": frames,
+        "segments": segments,
+        "motionSegments": [],
+        "audioSegments": audio_segments,
+    }
+
+    return json.dumps(timeline)
 
 
 def upload_audio():
@@ -691,25 +777,71 @@ def mainLTXDirector(
         clear_output()
 
         # --- Step 8: LTXDirector ---
-        # This node bundles global prompt, per-segment images, audio track,
-        # and retake configuration all in one node.
+        # The LTXDirector node receives its timeline configuration (images, audio,
+        # segments, prompt, retake config) through a single serialized JSON blob
+        # parameter called 'timeline_data' (widgets_values[6] in the workflow JSON).
+        # It also accepts scalar widget parameters for frame_rate, dimensions, etc.
+        # The linked inputs are: model, clip, audio_vae, optional_latent, global_prompt.
+        #
+        # TODO: The exact EXECUTE_NORMALIZED signature is derived from the workflow
+        # JSON widget_values structure. If the node source uses different parameter
+        # names, inspect custom_nodes/whatdreamscost-comfyui/ for the actual method.
         print("Running LTXDirector...")
         ltxdirector = NODE_CLASS_MAPPINGS["LTXDirector"]()
+
+        # Build the timeline_data JSON blob from user inputs
+        timeline_data_json = build_timeline_data(
+            image_paths=image_paths if image_paths else [],
+            audio_path=audio_path,
+            audio_trim_start=audio_trim_start,
+            global_prompt=global_prompt,
+            frames=frames,
+        )
+
+        # Compute segment_lengths string (comma-separated frame lengths per segment)
+        num_images = len(image_paths) if image_paths else 0
+        if num_images > 0:
+            seg_len = frames / num_images
+            segment_lengths_str = ",".join([str(seg_len)] * num_images)
+        else:
+            segment_lengths_str = ""
+
+        # Guide strengths: one "1.00" per segment
+        guide_strength_str = ",".join(["1.00"] * max(num_images, 1))
+
+        # Local prompts: empty per-segment prompts separated by " | "
+        local_prompts_str = " | ".join([""] * max(num_images, 1))
+
         ltxdirector_131 = ltxdirector.EXECUTE_NORMALIZED(
+            # Linked inputs (from other nodes)
             model=get_value_at_index(modelpreviewoverridekj_10, 0),
             clip=get_value_at_index(powerloraloaderrgthree_138, 1),
             audio_vae=get_value_at_index(vaeloader_8, 0),
+            # STRING input slot (global_prompt can be passed as linked input or widget)
             global_prompt=global_prompt,
+            # Widget parameters matching the node's properties/widgets_values schema:
+            # widgets_values[6]: timeline JSON blob
+            timeline_data=timeline_data_json,
+            # widgets_values[7]: per-segment local prompts
+            local_prompts=local_prompts_str,
+            # widgets_values[8]: per-segment frame lengths
+            segment_lengths=segment_lengths_str,
+            # widgets_values[9]: epsilon
+            epsilon=0.001,
+            # widgets_values[10]: guide strengths per segment
+            guide_strength=guide_strength_str,
+            # widgets_values[11-13]: track enable flags
+            mainTrackEnabled=True,
+            audioTrackEnabled=bool(audio_path),
+            motionTrackEnabled=True,
+            # widgets_values[14]: frame rate
             frame_rate=fps,
+            # widgets_values[16-20]: dimension and compression settings
             custom_width=width,
             custom_height=height,
             resize_method="maintain aspect ratio",
             divisible_by=32,
             img_compression=18,
-            normalDurationFrames=frames,
-            image_paths=image_paths if image_paths else [],
-            audio_path=audio_path,
-            audio_trim_start=audio_trim_start,
         )
 
         # Delete clip after LTXDirector has encoded the prompt
