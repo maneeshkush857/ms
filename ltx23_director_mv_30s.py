@@ -344,14 +344,18 @@ def upload_image():
     return None
 
 
-def upload_multiple_images(count=5):
-    """Upload multiple images for timeline segments."""
+def upload_multiple_images(count=1):
+    """Upload reference image(s) for video conditioning.
+    
+    Note: The pipeline uses only the first uploaded image as the
+    conditioning frame. Additional images are ignored.
+    """
     from google.colab import files
     import os
 
     os.makedirs('/content/ComfyUI/input/whatdreamscost', exist_ok=True)
 
-    print(f"Upload up to {count} images for timeline segments:")
+    print(f"Upload up to {count} reference image(s) for conditioning:")
     uploaded = files.upload()
 
     paths = []
@@ -523,14 +527,14 @@ print("All model downloads complete!")
 # @markdown Upload reference images for timeline segments and audio track.
 
 # @markdown ### Image Segments
-# @markdown Upload up to 5 reference images for the video timeline.
-# @markdown Images will be distributed across the video duration.
+# @markdown Upload a reference image for video conditioning.
+# @markdown (Only the first image is used as the conditioning frame.)
 upload_images_now = True  # @param {type:"boolean"}
 image_files = []
 if upload_images_now:
-    image_files = upload_multiple_images(count=5)
+    image_files = upload_multiple_images(count=1)
     clear_output()
-    print(f"Uploaded {len(image_files)} images for timeline segments.")
+    print(f"Uploaded {len(image_files)} image(s) for conditioning.")
 
 # @markdown ### Audio Track
 upload_audio_now = True  # @param {type:"boolean"}
@@ -616,7 +620,7 @@ def mainLTXDirector(
                 clip=current_clip,
                 lora_name=lora_distilled_file,
                 strength_model=lora_distilled_strength,
-                strength_clip=lora_distilled_strength,
+                strength_clip=1.0,
             )
             current_model = result[0]
             current_clip = result[1]
@@ -627,7 +631,7 @@ def mainLTXDirector(
                 clip=current_clip,
                 lora_name=lora_omninft_file,
                 strength_model=lora_omninft_strength,
-                strength_clip=lora_omninft_strength,
+                strength_clip=1.0,
             )
             current_model = result[0]
             current_clip = result[1]
@@ -638,7 +642,7 @@ def mainLTXDirector(
                 clip=current_clip,
                 lora_name=lora_transition_file,
                 strength_model=lora_transition_strength,
-                strength_clip=lora_transition_strength,
+                strength_clip=1.0,
             )
             current_model = result[0]
             current_clip = result[1]
@@ -649,7 +653,7 @@ def mainLTXDirector(
                 clip=current_clip,
                 lora_name=lora_mvcamera_file,
                 strength_model=lora_mvcamera_strength,
-                strength_clip=lora_mvcamera_strength,
+                strength_clip=1.0,
             )
             current_model = result[0]
             current_clip = result[1]
@@ -711,11 +715,15 @@ def mainLTXDirector(
             has_image = False
 
         # 8c: Create empty video latent at half resolution for pass 1
-        # (the original LTXDirectorGuide #133 used downscale_factor=0.5)
+        # The two-pass strategy samples at half-res first (coarse pass), then
+        # LTXVLatentUpsampler handles the 2x upscale, and pass 2 refines at full-res.
+        # Snap to nearest multiple of 32 as required by the latent dimensions.
+        pass1_width = (width // 2 + 31) // 32 * 32
+        pass1_height = (height // 2 + 31) // 32 * 32
         emptyltxvlatentvideo = NODE_CLASS_MAPPINGS["EmptyLTXVLatentVideo"]()
         emptyltxvlatentvideo_result = emptyltxvlatentvideo.EXECUTE_NORMALIZED(
-            width=width,
-            height=height,
+            width=pass1_width,
+            height=pass1_height,
             length=frames,
             batch_size=1,
         )
