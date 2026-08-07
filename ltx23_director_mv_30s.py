@@ -166,7 +166,7 @@ def download_lora(link, folder="/content/ComfyUI/models/loras", civitai_token=No
     else:
         return download_with_aria2c(link, folder)
 
-def model_download(url: str, dest_dir: str, filename: str = None, silent: bool = True) -> bool:
+def model_download(url: str, dest_dir: str, filename: str = None, silent: bool = True) -> str:
     """
     Colab-optimized download with aria2c
 
@@ -177,13 +177,14 @@ def model_download(url: str, dest_dir: str, filename: str = None, silent: bool =
         silent: If True, suppresses all output (except errors)
 
     Returns:
-        bool: True if successful, False if failed
+        str: The filename of the downloaded model (always returned even on error,
+             since the file may already exist from a previous run)
     """
+    if filename is None:
+        filename = url.split('/')[-1].split('?')[0]
+
     try:
         Path(dest_dir).mkdir(parents=True, exist_ok=True)
-
-        if filename is None:
-            filename = url.split('/')[-1].split('?')[0]
 
         cmd = [
             'aria2c',
@@ -204,15 +205,14 @@ def model_download(url: str, dest_dir: str, filename: str = None, silent: bool =
             print("Done!")
         else:
             print(f"Downloaded {filename} to {dest_dir}")
-        return filename
 
     except subprocess.CalledProcessError as e:
         error = e.stderr.strip() or "Unknown error"
         print(f"\nError downloading {filename}: {error}")
-        return False
     except Exception as e:
         print(f"\nError: {str(e)}")
-        return False
+
+    return filename
 
 
 
