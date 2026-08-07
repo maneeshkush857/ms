@@ -1,0 +1,26 @@
+{
+  "id": "FEAT-002",
+  "type": "fix",
+  "description": "Address issues found in the 2025-01-15 review of ltx23_director_mv_30s.py: UNet filename mismatch, missing pip install for whatdreamscost-comfyui, frame_rate propagation from LTXDirector output, and Power Lora Loader API TODO comment",
+  "status": "completed",
+  "steps": [
+    "Fix UNet filename mismatch: change load_unet(unet_name=\"ltx-2-3-22b-dev-Q4_K_M.gguf\") to use the dit_model variable instead",
+    "Add pip install -r requirements.txt for whatdreamscost-comfyui repo in Cell 1",
+    "Fix frame_rate propagation: LTXVConditioning and VHS_VideoCombine should use get_value_at_index(ltxdirector_131, 6) instead of the fps parameter",
+    "Add TODO comment on Power Lora Loader API noting the contract is unverified",
+    "Issue 2 (empty LoRA URLs) is already addressed with TODO comments - no change needed"
+  ],
+  "acceptance_criteria": [
+    "load_unet uses dit_model variable instead of hardcoded filename",
+    "whatdreamscost-comfyui has pip install -r requirements.txt after clone",
+    "LTXVConditioning frame_rate uses get_value_at_index(ltxdirector_131, 6)",
+    "VHS_VideoCombine frame_rate uses get_value_at_index(ltxdirector_131, 6)",
+    "Power Lora Loader EXECUTE_NORMALIZED call has a TODO comment about unverified API contract",
+    "File still passes AST syntax validation"
+  ],
+  "verification": [
+    "python3 -c \"import ast; content = open('ltx23_director_mv_30s.py').read(); lines = content.split('\\n'); clean = '\\n'.join(['# '+l if l.strip().startswith('!') or l.strip().startswith('# %cd') else l for l in lines]); ast.parse(clean); print('OK')\""
+  ],
+  "blocked_reason": null,
+  "findings": "All 5 review issues addressed: (1) UNet filename mismatch fixed by using dit_model variable, (2) Empty LoRA URLs already have TODO comments and are acceptable per user instructions, (3) whatdreamscost-comfyui now has pip install -r requirements.txt, (4) Power Lora Loader has a TODO comment about unverified API contract, (5) frame_rate propagation fixed to use get_value_at_index(ltxdirector_131, 6) for LTXVConditioning and VHS_VideoCombine. LTXDirector still receives fps as its input (correct, since it is the node that computes the output frame_rate). AST syntax validation passes."
+}

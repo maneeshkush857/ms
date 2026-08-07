@@ -48,6 +48,8 @@ import subprocess
 !pip install -r requirements.txt
 # %cd /content/ComfyUI/custom_nodes/ComfyUI_GGUF
 !pip install -r requirements.txt
+# %cd /content/ComfyUI/custom_nodes/whatdreamscost-comfyui
+!pip install -r requirements.txt
 # %cd /content/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite
 !pip install -r requirements.txt
 
@@ -590,7 +592,7 @@ def mainLTXDirector(
         print("Loading UNet...")
         unetloadergguf = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]()
         unetloadergguf_135 = unetloadergguf.load_unet(
-            unet_name="ltx-2-3-22b-dev-Q4_K_M.gguf"
+            unet_name=dit_model
         )
 
         # --- Step 2: Load DualCLIP ---
@@ -638,6 +640,11 @@ def mainLTXDirector(
                 "strengthTwo": None,
             })
 
+        # TODO: The Power Lora Loader (rgthree) API contract is unverified.
+        # The loras kwarg is passed as a list of dicts, but the actual node may
+        # expect a different serialization format (widget_values use a list with
+        # header widgets interspersed). If this call fails, check rgthree's source
+        # for the correct EXECUTE_NORMALIZED signature.
         powerloraloaderrgthree_138 = powerloraloaderrgthree.EXECUTE_NORMALIZED(
             model=get_value_at_index(unetloadergguf_135, 0),
             clip=get_value_at_index(dualcliploader_12, 0),
@@ -724,7 +731,7 @@ def mainLTXDirector(
         # --- Step 10: LTXVConditioning ---
         ltxvconditioning = NODE_CLASS_MAPPINGS["LTXVConditioning"]()
         ltxvconditioning_10 = ltxvconditioning.EXECUTE_NORMALIZED(
-            frame_rate=fps,
+            frame_rate=get_value_at_index(ltxdirector_131, 6),
             positive=get_value_at_index(ltxdirector_131, 1),
             negative=get_value_at_index(conditioningzeroout_9, 0),
         )
@@ -958,7 +965,7 @@ def mainLTXDirector(
         vhs_videocombine_139 = vhs_videocombine.EXECUTE_NORMALIZED(
             images=get_value_at_index(vaedecode_result, 0),
             audio=get_value_at_index(ltxvaudiovaedecode_result, 0),
-            frame_rate=fps,
+            frame_rate=get_value_at_index(ltxdirector_131, 6),
             loop_count=0,
             filename_prefix="LTX2.3/Video",
             format="video/h264-mp4",
