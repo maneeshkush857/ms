@@ -45,8 +45,9 @@ def setup_environment():
 
     # Clone ComfyUI
     os.chdir("/content")
-    subprocess.run(["git", "clone", "https://github.com/comfyanonymous/ComfyUI.git"],
-                   check=True, capture_output=True)
+    if not os.path.exists("/content/ComfyUI"):
+        subprocess.run(["git", "clone", "https://github.com/comfyanonymous/ComfyUI.git"],
+                       check=True, capture_output=True)
     subprocess.run([sys.executable, "-m", "pip", "install", "-q",
                     "-r", "/content/ComfyUI/requirements.txt"],
                    check=True, capture_output=True)
@@ -61,7 +62,9 @@ def setup_environment():
         "https://github.com/kijai/ComfyUI-KJNodes",
     ]
     for repo in custom_repos:
-        subprocess.run(["git", "clone", repo], check=True, capture_output=True)
+        repo_name = repo.rstrip("/").split("/")[-1].removesuffix(".git")
+        if not os.path.exists(f"/content/ComfyUI/custom_nodes/{repo_name}"):
+            subprocess.run(["git", "clone", repo], check=True, capture_output=True)
 
     # Install custom node requirements
     for node_dir in ["ComfyUI-GGUF", "ComfyUI-KJNodes", "ComfyUI-VideoHelperSuite"]:
