@@ -90,7 +90,6 @@ import cv2
 from PIL import Image
 import gc
 import imageio
-import shutil
 from google.colab import files
 from IPython.display import display, HTML, Image as IPImage
 sys.path.insert(0, '/content/ComfyUI')
@@ -320,10 +319,10 @@ def upload_file():
     uploaded = files.upload()
 
     paths = []
-    for filename in uploaded.keys():
-        src_path = f'/content/ComfyUI/{filename}'
+    for filename, content in uploaded.items():
         dest_path = f'/content/ComfyUI/input/{filename}'
-        shutil.move(src_path, dest_path)
+        with open(dest_path, 'wb') as f:
+            f.write(content)
         paths.append(dest_path)
         print(f"File saved to: {dest_path}")
 
@@ -334,17 +333,15 @@ def upload_image():
     """Handle image upload in Colab and store in /content/ComfyUI/input/"""
     from google.colab import files
     import os
-    import shutil
 
     os.makedirs('/content/ComfyUI/input', exist_ok=True)
 
     uploaded = files.upload()
 
-    for filename in uploaded.keys():
-        src_path = f'/content/ComfyUI/{filename}'
+    for filename, content in uploaded.items():
         dest_path = f'/content/ComfyUI/input/{filename}'
-
-        shutil.move(src_path, dest_path)
+        with open(dest_path, 'wb') as f:
+            f.write(content)
         return dest_path
 
     return None
@@ -354,7 +351,6 @@ def upload_multiple_images(count=5):
     """Upload multiple images for timeline segments."""
     from google.colab import files
     import os
-    import shutil
 
     os.makedirs('/content/ComfyUI/input/whatdreamscost', exist_ok=True)
 
@@ -362,10 +358,10 @@ def upload_multiple_images(count=5):
     uploaded = files.upload()
 
     paths = []
-    for filename in uploaded.keys():
-        src_path = f'/content/ComfyUI/{filename}'
+    for filename, content in uploaded.items():
         dest_path = f'/content/ComfyUI/input/whatdreamscost/{filename}'
-        shutil.move(src_path, dest_path)
+        with open(dest_path, 'wb') as f:
+            f.write(content)
         paths.append(dest_path)
         print(f"Image saved to: {dest_path}")
 
@@ -461,17 +457,16 @@ def upload_audio():
     """Upload a single audio file for the music track."""
     from google.colab import files
     import os
-    import shutil
 
     os.makedirs('/content/ComfyUI/input/whatdreamscost', exist_ok=True)
 
     print("Upload your audio file (mp3/wav):")
     uploaded = files.upload()
 
-    for filename in uploaded.keys():
-        src_path = f'/content/ComfyUI/{filename}'
+    for filename, content in uploaded.items():
         dest_path = f'/content/ComfyUI/input/whatdreamscost/{filename}'
-        shutil.move(src_path, dest_path)
+        with open(dest_path, 'wb') as f:
+            f.write(content)
         print(f"Audio saved to: {dest_path}")
         return dest_path
 
