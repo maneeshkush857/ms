@@ -2,7 +2,7 @@
   "id": "FEAT-004",
   "type": "fix",
   "description": "Fix upload helper functions to write file bytes directly from the uploaded dict instead of using shutil.move() with hardcoded paths that fail when Colab renames files or when the current working directory differs from /content/ComfyUI/",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "Fix upload_file() to write uploaded[filename] bytes to dest_path directly",
     "Fix upload_image() to write uploaded[filename] bytes to dest_path directly",
@@ -19,5 +19,5 @@
     "python3 -c \"import ast; content = open('ltx23_director_mv_30s.py').read(); lines = content.split('\\n'); clean = '\\n'.join(['# '+l if l.strip().startswith('!') or l.strip().startswith('# %cd') else l for l in lines]); ast.parse(clean); print('OK')\""
   ],
   "blocked_reason": null,
-  "findings": null
+  "findings": "All four upload helper functions fixed to write bytes directly from the uploaded dict. Removed all shutil references (top-level import and local imports). AST syntax validation passes."
 }
