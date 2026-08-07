@@ -40,7 +40,7 @@ def setup_environment():
                    check=True, capture_output=True)
     subprocess.run([sys.executable, "-m", "pip", "install", "-q",
                     "av", "spandrel", "albumentations", "onnx",
-                    "opencv-python", "onnxruntime"],
+                    "opencv-python", "onnxruntime", "nest_asyncio"],
                    check=True, capture_output=True)
 
     # Clone ComfyUI
@@ -202,40 +202,62 @@ from nodes import NODE_CLASS_MAPPINGS
 # GGUF UNet model
 ltx_model_url = "https://huggingface.co/Kijai/LTXV2_comfy/resolve/main/diffusion_models/ltx-2-3-22b-dev-Q4_K_M.gguf"
 dit_model = model_download(ltx_model_url, "/content/ComfyUI/models/unet")
+if not dit_model:
+    raise RuntimeError("Failed to download UNet GGUF model, aborting pipeline")
 
 # Text encoders
 text_encoder1_url = "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"
 text_encoder1_model = model_download(text_encoder1_url, "/content/ComfyUI/models/text_encoders")
+if not text_encoder1_model:
+    raise RuntimeError("Failed to download text encoder 1, aborting pipeline")
 
 text_encoder2_url = "https://huggingface.co/Kijai/LTXV2_comfy/resolve/main/text_encoders/ltx-2.3_text_projection_bf16.safetensors"
 text_encoder2_model = model_download(text_encoder2_url, "/content/ComfyUI/models/text_encoders")
+if not text_encoder2_model:
+    raise RuntimeError("Failed to download text encoder 2, aborting pipeline")
 
 # VAE models
 video_vae_url = "https://huggingface.co/Kijai/LTXV2_comfy/resolve/main/VAE/LTX23_video_vae_bf16.safetensors"
 video_vae_model = model_download(video_vae_url, "/content/ComfyUI/models/vae")
+if not video_vae_model:
+    raise RuntimeError("Failed to download video VAE model, aborting pipeline")
 
 audio_vae_url = "https://huggingface.co/Kijai/LTXV2_comfy/resolve/main/VAE/LTX23_audio_vae_bf16.safetensors"
 audio_vae_model = model_download(audio_vae_url, "/content/ComfyUI/models/vae")
+if not audio_vae_model:
+    raise RuntimeError("Failed to download audio VAE model, aborting pipeline")
 
 tiny_vae_url = "https://huggingface.co/Kijai/LTXV2_comfy/resolve/main/VAE/taeltx2_3.safetensors"
 tiny_vae_model = model_download(tiny_vae_url, "/content/ComfyUI/models/vae")
+if not tiny_vae_model:
+    raise RuntimeError("Failed to download tiny VAE model, aborting pipeline")
 
 # Spatial upscaler
 upscaler_url = "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 upscaler_model = model_download(upscaler_url, "/content/ComfyUI/models/latent_upscale_models")
+if not upscaler_model:
+    raise RuntimeError("Failed to download spatial upscaler model, aborting pipeline")
 
 # LoRA models
 lora1_url = "https://huggingface.co/Kijai/LTXV2_comfy/resolve/main/loras/ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors"
 lora1_model = model_download(lora1_url, "/content/ComfyUI/models/loras")
+if not lora1_model:
+    raise RuntimeError("Failed to download LoRA 1 (distilled), aborting pipeline")
 
 lora2_url = "https://huggingface.co/Kijai/LTXV2_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors"
 lora2_model = model_download(lora2_url, "/content/ComfyUI/models/loras")
+if not lora2_model:
+    raise RuntimeError("Failed to download LoRA 2 (OmniNFT-RL), aborting pipeline")
 
 lora3_url = "https://huggingface.co/Kijai/LTXV2_comfy/resolve/main/loras/ltx2.3-transition.safetensors"
 lora3_model = model_download(lora3_url, "/content/ComfyUI/models/loras")
+if not lora3_model:
+    raise RuntimeError("Failed to download LoRA 3 (transition), aborting pipeline")
 
 lora4_url = "https://huggingface.co/Kijai/LTXV2_comfy/resolve/main/loras/LTX2.3-MVCamera-drclips.safetensors"
 lora4_model = model_download(lora4_url, "/content/ComfyUI/models/loras")
+if not lora4_model:
+    raise RuntimeError("Failed to download LoRA 4 (MVCamera), aborting pipeline")
 
 print("All models downloaded successfully!")
 
@@ -319,17 +341,21 @@ def mainLTX(
         # --------------------------------------------------------
         print("Loading LoRAs...")
         power_lora_loader = NODE_CLASS_MAPPINGS["Power Lora Loader (rgthree)"]()
-        power_lora_138 = power_lora_loader.load_loras(
+        power_lora_138 = power_lora_loader.EXECUTE_NORMALIZED(
             model=get_value_at_index(unetloadergguf_135, 0),
             clip=get_value_at_index(dualcliploader_12, 0),
-            lora_01="ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors",
-            strength_01=0.4,
-            lora_02="LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors",
-            strength_02=0.6,
-            lora_03="ltx2.3-transition.safetensors",
-            strength_03=0.7,
-            lora_04="LTX2.3-MVCamera-drclips.safetensors",
-            strength_04=0.9,
+            lora_1="ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors",
+            strength_1=0.4,
+            strength_two_1=None,
+            lora_2="LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors",
+            strength_2=0.6,
+            strength_two_2=None,
+            lora_3="ltx2.3-transition.safetensors",
+            strength_3=0.7,
+            strength_two_3=None,
+            lora_4="LTX2.3-MVCamera-drclips.safetensors",
+            strength_4=0.9,
+            strength_two_4=None,
         )
 
         # Free text encoder memory after LoRA application
@@ -556,7 +582,7 @@ def mainLTX(
         # --------------------------------------------------------
         print("Upsampling latent...")
         ltxvlatentupsampler = NODE_CLASS_MAPPINGS["LTXVLatentUpsampler"]()
-        ltxvlatentupsampler_14 = ltxvlatentupsampler.upsample_latent(
+        ltxvlatentupsampler_14 = ltxvlatentupsampler.EXECUTE_NORMALIZED(
             samples=get_value_at_index(ltxdirectorcropguides_55, 2),
             upscale_model=get_value_at_index(latentupscalemodelloader_13, 0),
             vae=get_value_at_index(vaeloader_36, 0),
@@ -717,7 +743,7 @@ def mainLTX(
         # --------------------------------------------------------
         print("Combining video and audio...")
         vhs_videocombine = NODE_CLASS_MAPPINGS["VHS_VideoCombine"]()
-        vhs_videocombine_139 = vhs_videocombine.combine_video(
+        vhs_videocombine_139 = vhs_videocombine.EXECUTE_NORMALIZED(
             frame_rate=get_value_at_index(ltxdirector_131, 6),
             loop_count=0,
             filename_prefix="LTX-2.3-Director",
