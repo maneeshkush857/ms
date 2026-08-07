@@ -1,0 +1,25 @@
+{
+  "id": "FEAT-005",
+  "type": "fix",
+  "description": "Replace Power Lora Loader (rgthree) with sequential standard LoraLoader calls to fix KeyError when the rgthree node is not available in NODE_CLASS_MAPPINGS",
+  "status": "completed",
+  "steps": [
+    "Remove Power Lora Loader (rgthree) instantiation and EXECUTE_NORMALIZED call",
+    "Replace with sequential LoraLoader calls that modify both model and clip",
+    "Store final model and clip as a tuple in powerloraloaderrgthree_138 so downstream references still work",
+    "Remove rgthree-comfy git clone from setup since it is no longer needed",
+    "Verify AST syntax and content checks pass"
+  ],
+  "acceptance_criteria": [
+    "No reference to NODE_CLASS_MAPPINGS['Power Lora Loader (rgthree)'] in executable code",
+    "LoraLoader is used sequentially for each enabled LoRA",
+    "powerloraloaderrgthree_138[0] returns final model and [1] returns final clip",
+    "All downstream references to powerloraloaderrgthree_138 remain unchanged",
+    "File passes AST syntax validation"
+  ],
+  "verification": [
+    "python3 -c \"import ast; content = open('ltx23_director_mv_30s.py').read(); lines = content.split('\\n'); clean = '\\n'.join(['# '+l if l.strip().startswith('!') or l.strip().startswith('# %cd') else l for l in lines]); ast.parse(clean); print('OK')\""
+  ],
+  "blocked_reason": null,
+  "findings": "The standard ComfyUI LoraLoader node handles both model and clip modification. Sequential calls chain model+clip through each enabled LoRA. The rgthree-comfy custom node repo is no longer needed since we use the built-in LoraLoader."
+}

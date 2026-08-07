@@ -41,7 +41,7 @@ import subprocess
 !git clone --branch ComfyUI_GGUF_22_01_2026 https://github.com/Isi-dev/ComfyUI_GGUF.git
 # TODO: verify -- whatdreamscost-comfyui is assumed to be the repo for LTXDirector/LTXDirectorGuide/LTXDirectorCropGuides nodes
 !git clone https://github.com/whatdreamscost/whatdreamscost-comfyui.git
-!git clone https://github.com/rgthree/rgthree-comfy.git
+# NOTE: rgthree-comfy no longer needed -- LoRA loading uses built-in LoraLoader node
 !git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
 
 # %cd /content/ComfyUI/custom_nodes/ComfyUI_KJNodes
@@ -686,51 +686,64 @@ def mainLTXDirector(
             device="default",
         )
 
-        # --- Step 3: Power Lora Loader (rgthree) - stack 4 LoRAs ---
+        # --- Step 3: Load LoRAs sequentially using standard LoraLoader ---
+        # Replaces the Power Lora Loader (rgthree) node which is not available
+        # in standard ComfyUI. Uses sequential LoraLoader calls that modify both
+        # model and clip, matching the workflow's intent.
         print("Loading LoRAs...")
-        powerloraloaderrgthree = NODE_CLASS_MAPPINGS["Power Lora Loader (rgthree)"]()
+        loraloader = NODE_CLASS_MAPPINGS["LoraLoader"]()
 
-        # Build lora_stack configuration
-        lora_stack = []
+        # Start with base model and clip from previous steps
+        current_model = get_value_at_index(unetloadergguf_135, 0)
+        current_clip = get_value_at_index(dualcliploader_12, 0)
+
         if use_lora_distilled and lora_distilled_file:
-            lora_stack.append({
-                "on": True,
-                "lora": lora_distilled_file,
-                "strength": lora_distilled_strength,
-                "strengthTwo": None,
-            })
-        if use_lora_omninft and lora_omninft_file:
-            lora_stack.append({
-                "on": True,
-                "lora": lora_omninft_file,
-                "strength": lora_omninft_strength,
-                "strengthTwo": None,
-            })
-        if use_lora_transition and lora_transition_file:
-            lora_stack.append({
-                "on": True,
-                "lora": lora_transition_file,
-                "strength": lora_transition_strength,
-                "strengthTwo": None,
-            })
-        if use_lora_mvcamera and lora_mvcamera_file:
-            lora_stack.append({
-                "on": True,
-                "lora": lora_mvcamera_file,
-                "strength": lora_mvcamera_strength,
-                "strengthTwo": None,
-            })
+            result = loraloader.load_lora(
+                model=current_model,
+                clip=current_clip,
+                lora_name=lora_distilled_file,
+                strength_model=lora_distilled_strength,
+                strength_clip=lora_distilled_strength,
+            )
+            current_model = result[0]
+            current_clip = result[1]
 
-        # TODO: The Power Lora Loader (rgthree) API contract is unverified.
-        # The loras kwarg is passed as a list of dicts, but the actual node may
-        # expect a different serialization format (widget_values use a list with
-        # header widgets interspersed). If this call fails, check rgthree's source
-        # for the correct EXECUTE_NORMALIZED signature.
-        powerloraloaderrgthree_138 = powerloraloaderrgthree.EXECUTE_NORMALIZED(
-            model=get_value_at_index(unetloadergguf_135, 0),
-            clip=get_value_at_index(dualcliploader_12, 0),
-            loras=lora_stack,
-        )
+        if use_lora_omninft and lora_omninft_file:
+            result = loraloader.load_lora(
+                model=current_model,
+                clip=current_clip,
+                lora_name=lora_omninft_file,
+                strength_model=lora_omninft_strength,
+                strength_clip=lora_omninft_strength,
+            )
+            current_model = result[0]
+            current_clip = result[1]
+
+        if use_lora_transition and lora_transition_file:
+            result = loraloader.load_lora(
+                model=current_model,
+                clip=current_clip,
+                lora_name=lora_transition_file,
+                strength_model=lora_transition_strength,
+                strength_clip=lora_transition_strength,
+            )
+            current_model = result[0]
+            current_clip = result[1]
+
+        if use_lora_mvcamera and lora_mvcamera_file:
+            result = loraloader.load_lora(
+                model=current_model,
+                clip=current_clip,
+                lora_name=lora_mvcamera_file,
+                strength_model=lora_mvcamera_strength,
+                strength_clip=lora_mvcamera_strength,
+            )
+            current_model = result[0]
+            current_clip = result[1]
+
+        # Store as tuple so downstream code can use get_value_at_index:
+        # index 0 = model, index 1 = clip
+        powerloraloaderrgthree_138 = (current_model, current_clip)
 
         clear_output()
 
