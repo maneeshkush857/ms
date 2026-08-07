@@ -1,0 +1,7 @@
+{
+  "task_id": "task-convert-director-workflow",
+  "task_description": "Convert the LTX-2.3 Director 2.0 MV Workflow (30s) ComfyUI JSON into a single-file Google Colab notebook script (ltx23_director_mv_30s.py) following the exact conventions of the reference ltx2_ti2v_distilled.py",
+  "status": "in_progress",
+  "feature_order": ["FEAT-001"],
+  "blocked_reason": null
+}

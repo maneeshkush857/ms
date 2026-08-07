@@ -1,0 +1,38 @@
+{
+  "id": "FEAT-001",
+  "type": "feat",
+  "description": "Create the complete ltx23_director_mv_30s.py Colab notebook script by converting the LTX-2.3 Director 2.0 MV Workflow JSON into a single-file Python script following the exact conventions of ltx2_ti2v_distilled.py",
+  "status": "in_progress",
+  "steps": [
+    "Read /projects/sandbox/ms/ltx2_ti2v_distilled.py to understand the exact coding style, cell structure, helper functions, and NODE_CLASS_MAPPINGS execution pattern",
+    "Read /projects/sandbox/ms/LTX-2.3_Director_2.0-MV-Workflow-30s.json to extract all node types, widget_values, links, and execution order",
+    "Write Cell 1 (Environment Preparation): pip installs (torch/torchvision/torchsde/diffusers/accelerate/av/spandrel/opencv/onnxruntime), git clone ComfyUI + custom node repos (ComfyUI_KJNodes, ComfyUI_GGUF, rgthree-comfy for Power Lora Loader, ComfyUI-VideoHelperSuite for VHS_VideoCombine, and whatdreamscost-comfyui for LTXDirector/LTXDirectorGuide/LTXDirectorCropGuides). Install apt packages aria2 and ffmpeg.",
+    "Write Cell 2 (Helper Functions): Copy over get_value_at_index, find_path, import_custom_nodes (with asyncio+nest_asyncio), model_download/download_with_aria2c, download_lora/download_civitai_model, upload_file, upload_image, extract_frames, display_video, save_video_from_components, clear_memory functions from reference",
+    "Write Cell 3 (Model Downloads): Create @param download cells for: (1) ltx-2-3-22b-dev-Q4_K_M.gguf UNet from HF, (2) gemma_3_12B_it_fp4_mixed.safetensors text encoder, (3) ltx-2.3_text_projection_bf16.safetensors, (4) LTX23_video_vae_bf16.safetensors, (5) LTX23_audio_vae_bf16.safetensors, (6) taeltx2_3.safetensors tiny preview VAE, (7) ltx-2.3-spatial-upscaler-x2-1.1.safetensors. Add 4 LoRA download sections with user-editable @param URL fields and on/off toggles with default strengths 0.4, 0.6, 0.7, 0.9",
+    "Write Cell 4 (Media Upload Helpers): Multi-image upload for timeline segments (up to 5 images), single audio file upload, trim_start_frames parameter. Adapt upload_file pattern from reference.",
+    "Write Cell 5 (mainLTX function): Implement the full node graph execution order as documented in the user instruction section 5. Key nodes in order: (1) UnetLoaderGGUF, (2) DualCLIPLoader with gemma+projection type=ltxv, (3) Power Lora Loader stacking 4 LoRAs, (4) VAELoaderKJ for tiny preview VAE taeltx2_3 bf16, (5) ModelPreviewOverrideKJ, (6) VAELoader audio, (7) VAELoader video, (8) LTXDirector with global_prompt/segments/audio, (9) ConditioningZeroOut, (10) LTXVConditioning frame_rate=24, then PASS 1: LTXDirectorGuide#133 (strength=1,downscale=0.5), LTXVConcatAVLatent, BasicScheduler(linear_quadratic,8,1), KSamplerSelect(euler), RandomNoise(seed,fixed), CFGGuider(cfg=1), SamplerCustomAdvanced, LTXVSeparateAVLatent. Then crop+upscale: LTXDirectorCropGuides#55, LTXVLatentUpsampler with spatial x2. Then PASS 2: LTXDirectorGuide#132 (strength=1,downscale=1), LTXVConcatAVLatent, BasicScheduler(linear_quadratic,4,0.42), KSamplerSelect(euler), CFGGuider(cfg=1), SamplerCustomAdvanced (SAME RandomNoise reused), LTXVSeparateAVLatent, LTXDirectorCropGuides#54. Finally decode+mux: VAEDecode, LTXVAudioVAEDecode, VHS_VideoCombine(frame_rate=24, h264-mp4, yuv420p, crf=8, prefix=LTX2.3/Video). Include del+empty_cache+gc.collect discipline after DualCLIPLoader, after VAEs, after upscaler, after UNet sampling complete.",
+    "Write Cell 6 (User Parameters + Invocation): @param form fields for global_prompt (multiline string with full default from JSON), width=1280, height=720, frames=756, fps=24, seed=0, 4 LoRA toggles/strengths, pass1_steps=8, pass1_denoise=1.0, pass2_steps=4, pass2_denoise=0.42, scheduler_name=linear_quadratic, sampler_name=euler. Add markdown note about A100/L4 requirement for 22B model.",
+    "Add a markdown header at top of file noting this is LTX-2.3 Director 2.0 MV Workflow (30s) and requires A100/L4 GPU (not T4 free tier)",
+    "Add # TODO: verify comments for unconfirmed LoRA source URLs and for whether whatdreamscost-comfyui is the correct repo name for LTXDirector nodes"
+  ],
+  "acceptance_criteria": [
+    "File /projects/sandbox/ms/ltx23_director_mv_30s.py exists and parses without Python syntax errors",
+    "File follows the six-cell structure of the reference script (environment, helpers, model downloads, media uploads, main function, params+invocation)",
+    "All 32 nodes from the JSON workflow are represented in the mainLTX function with correct widget_values as defaults",
+    "CFGGuider uses cfg=1 for both passes (matching JSON widgets_values [1])",
+    "BasicScheduler pass 1: linear_quadratic, 8 steps, denoise=1; pass 2: linear_quadratic, 4 steps, denoise=0.42",
+    "LTXDirectorGuide #133 uses downscale 0.5 (pass 1); #132 uses downscale 1 (pass 2)",
+    "Single RandomNoise instance is reused across both SamplerCustomAdvanced calls",
+    "4 LoRAs with strengths 0.4, 0.6, 0.7, 0.9 exposed as @param fields",
+    "VHS_VideoCombine configured with frame_rate=24, h264-mp4, yuv420p, crf=8",
+    "Memory cleanup (del + torch.cuda.empty_cache() + gc.collect()) after heavy model usage",
+    "torch.inference_mode() wrapper around generation code",
+    "Custom node repos cloned include rgthree-comfy, ComfyUI-VideoHelperSuite, and whatdreamscost-comfyui (with TODO verify comment)"
+  ],
+  "verification": [
+    "Run: cd /projects/sandbox/ms && python -c \"import ast; ast.parse(open('ltx23_director_mv_30s.py').read()); print('Syntax OK')\"",
+    "Run: cd /projects/sandbox/ms && python -c \"content = open('ltx23_director_mv_30s.py').read(); assert 'NODE_CLASS_MAPPINGS' in content; assert 'LTXDirector' in content; assert 'VHS_VideoCombine' in content; assert 'cfg=1' in content; assert 'linear_quadratic' in content; print('Content checks passed')\""
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}
