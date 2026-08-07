@@ -528,8 +528,9 @@ video_vae_model = model_download(video_vae_link, "/content/ComfyUI/models/vae")
 audio_vae_link = "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/vae/LTX23_audio_vae_bf16.safetensors"  # @param {"type":"string"}
 audio_vae_model = model_download(audio_vae_link, "/content/ComfyUI/models/vae")
 
-tiny_vae_link = "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/vae/taeltx2_3.safetensors"  # @param {"type":"string"}
-tiny_vae_model = model_download(tiny_vae_link, "/content/ComfyUI/models/vae")
+# tiny_vae_link not needed - ModelPreviewOverrideKJ is a GUI-only node, skipped in headless mode
+# tiny_vae_link = "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/vae/taeltx2_3.safetensors"
+# tiny_vae_model = model_download(tiny_vae_link, "/content/ComfyUI/models/vae")
 
 upscaler_link = "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"  # @param {"type":"string"}
 upscaler_model = model_download(upscaler_link, "/content/ComfyUI/models/latent_upscale_models")
@@ -747,31 +748,11 @@ def mainLTXDirector(
 
         clear_output()
 
-        # --- Step 4: Tiny Preview VAE (VAELoaderKJ) ---
-        print("Loading tiny preview VAE...")
-        vaeloaderkj = NODE_CLASS_MAPPINGS["VAELoaderKJ"]()
-        vaeloaderkj_6 = vaeloaderkj.load_vae(
-            vae_name=tiny_vae_model,
-            device="main_device",
-            weight_dtype="bf16",
-        )
-
-        # --- Step 5: ModelPreviewOverrideKJ ---
-        modelpreviewoverridekj = NODE_CLASS_MAPPINGS["ModelPreviewOverrideKJ"]()
-        modelpreviewoverridekj_10 = modelpreviewoverridekj.EXECUTE_NORMALIZED(
-            every_nth_frame=0,
-            max_preview_resolution=80,
-            enabled=True,
-            max_frames=240,
-            fps=24,
-            output_format="",
-            model=get_value_at_index(powerloraloaderrgthree_138, 0),
-            taesd=get_value_at_index(vaeloaderkj_6, 0),
-        )
-
-        del vaeloaderkj_6
-        torch.cuda.empty_cache()
-        gc.collect()
+        # Steps 4-5 (VAELoaderKJ + ModelPreviewOverrideKJ) removed:
+        # ModelPreviewOverrideKJ is a GUI-only preview node that simply passes the
+        # model through with a tiny VAE attached for live previews in ComfyUI's
+        # interface. It is not needed in headless/Colab execution and its API
+        # signature does not match the EXECUTE_NORMALIZED interface.
 
         # --- Step 6: Audio VAE ---
         print("Loading audio VAE...")
@@ -822,7 +803,7 @@ def mainLTXDirector(
 
         ltxdirector_131 = ltxdirector.EXECUTE_NORMALIZED(
             # Linked inputs (from other nodes)
-            model=get_value_at_index(modelpreviewoverridekj_10, 0),
+            model=get_value_at_index(powerloraloaderrgthree_138, 0),
             clip=get_value_at_index(powerloraloaderrgthree_138, 1),
             audio_vae=get_value_at_index(vaeloader_8, 0),
             # STRING input slot (global_prompt can be passed as linked input or widget)
