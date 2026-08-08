@@ -1,0 +1,20 @@
+{
+  "project_type": "Google Colab Python script for LTX-2.3 Director 2.0 Music Video pipeline",
+  "language": "Python",
+  "build_system": "None - standalone Colab script",
+  "test_framework": "None - manual verification via syntax check",
+  "build_command": "python -c \"import ast; ast.parse(open('/projects/ms/LTX23_Director_2_0_MV_Colab.py').read())\"",
+  "test_command": "python -c \"import ast; ast.parse(open('/projects/ms/LTX23_Director_2_0_MV_Colab.py').read()); print('Syntax OK')\"",
+  "verification_instructions": "1. Verify the file is valid Python via ast.parse. 2. Confirm all required components exist (MemoryManager, LTX23Config, chunk logic, two-stage sampling, LoRA loading, timeline parsing, FFmpeg assembly).",
+  "snapshot_or_generated_files": null,
+  "setup_instructions": "No setup needed - this is a standalone file generation task.",
+  "environment_constraints": "Target runtime is Google Colab with T4 GPU (16GB VRAM). The script itself must handle ComfyUI installation, model downloads, custom node setup. This sandbox only validates syntax.",
+  "contribution_requirements": "Single file output at /projects/ms/LTX23_Director_2_0_MV_Colab.py",
+  "key_patterns": "NODE_CLASS_MAPPINGS for node instantiation, EXECUTE_NORMALIZED() for node execution, get_value_at_index() for output extraction, LoraLoaderModelOnly for LoRA loading, del + torch.cuda.empty_cache() + gc.collect() for memory cleanup, two-pass sampling with latent upscale between passes, LTXDirector/LTXDirectorGuide/LTXDirectorCropGuides for director-guided generation",
+  "relevant_files": [
+    "/projects/ms/experiment_ltx23.py",
+    "/projects/ms/ltx2_ti2v_distilled.py",
+    "/projects/ms/LTX-2.3_Director_2.0-MV-Workflow-30s.json"
+  ],
+  "directory_structure": "/projects/ms/ contains 3 reference files: workflow JSON, and two reference Python implementations (experiment_ltx23.py for LTX-2.3 and ltx2_ti2v_distilled.py for LTX-2)"
+}

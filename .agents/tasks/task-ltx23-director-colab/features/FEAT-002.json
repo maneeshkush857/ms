@@ -1,0 +1,27 @@
+{
+  "id": "FEAT-002",
+  "type": "feat",
+  "description": "Add Colab UI @param section, update model URLs, update custom nodes to all 9, add setup cell function",
+  "status": "in_progress",
+  "steps": [
+    "1. Add Colab UI parameter section with @param annotations for LoRA toggles/strengths and sampling settings before if __name__ block",
+    "2. Update all model download URLs in download_models() to user's exact URLs",
+    "3. Update custom_nodes dict in setup_environment() to include all 9 nodes",
+    "4. Add a setup_and_download_models() cell function matching user's @title pattern with all URLs"
+  ],
+  "acceptance_criteria": [
+    "File contains @param annotations for all 4 LoRA toggles and strengths",
+    "File contains @param annotations for pass1_steps, pass1_denoise, pass2_steps, pass2_denoise, scheduler_name, sampler_name",
+    "Model URLs updated to exact user-specified URLs",
+    "Custom nodes list expanded to 9 nodes",
+    "Setup cell function present with @title annotation",
+    "File passes Python syntax check"
+  ],
+  "verification": [
+    "python3 -c \"import ast; ast.parse(open('/projects/ms/LTX23_Director_2_0_MV_Colab.py').read()); print('Syntax OK')\"",
+    "grep '@param' /projects/ms/LTX23_Director_2_0_MV_Colab.py | wc -l",
+    "grep 'ComfyUI-Manager' /projects/ms/LTX23_Director_2_0_MV_Colab.py"
+  ],
+  "blocked_reason": null,
+  "findings": null
+}

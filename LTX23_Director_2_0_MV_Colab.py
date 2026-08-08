@@ -818,11 +818,15 @@ def setup_environment(config: LTX23Config) -> None:
     custom_nodes_dir.mkdir(parents=True, exist_ok=True)
 
     custom_nodes = {
-        "ComfyUI-GGUF": "https://github.com/city96/ComfyUI-GGUF",
-        "ComfyUI-KJNodes": "https://github.com/kijai/ComfyUI-KJNodes",
-        "ComfyUI-LTXVideo": "https://github.com/Lightricks/ComfyUI-LTXVideo",
+        "ComfyUI-Manager": "https://github.com/comfy-org/ComfyUI-Manager",
+        "WhatDreamsCost-ComfyUI": "https://github.com/WhatDreamscost/WhatDreamsCost-ComfyUI",
         "rgthree-comfy": "https://github.com/rgthree/rgthree-comfy",
-        "comfyui-videohelpersuite": "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
+        "ComfyUI-Licon-MSR": "https://github.com/liconstudio/ComfyUI-Licon-MSR",
+        "ComfyUI-KJNodes": "https://github.com/kijai/ComfyUI-KJNodes",
+        "ComfyUI-GGUF": "https://github.com/city96/ComfyUI-GGUF",
+        "ComfyUI-LTXVideo": "https://github.com/Lightricks/ComfyUI-LTXVideo",
+        "ComfyUI-VideoHelperSuite": "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
+        "ComfyUI-MelBandRoFormer": "https://github.com/kijai/ComfyUI-MelBandRoFormer",
     }
 
     for name, url in custom_nodes.items():
@@ -892,31 +896,31 @@ def download_models(config: LTX23Config) -> None:
     model_downloads = [
         # UNet
         (
-            "https://huggingface.co/unsloth/LTX-2.3-GGUF/resolve/main/ltx-2-3-22b-dev-Q4_K_M.gguf",
+            "https://huggingface.co/vantagewithai/LTX-2.3-GGUF/resolve/main/dev/ltx-2-3-22b-dev-Q4_K_M.gguf",
             "unet",
             config.unet_model,
         ),
         # Video VAE
         (
-            "https://huggingface.co/unsloth/LTX-2.3-GGUF/resolve/main/vae/ltx-2.3-22b-dev_video_vae.safetensors",
+            "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/vae/LTX23_video_vae_bf16.safetensors",
             "vae",
             config.video_vae,
         ),
         # Audio VAE
         (
-            "https://huggingface.co/unsloth/LTX-2.3-GGUF/resolve/main/vae/ltx-2.3-22b-dev_audio_vae.safetensors",
+            "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/vae/LTX23_audio_vae_bf16.safetensors",
             "vae",
             config.audio_vae,
         ),
         # Tiny VAE (for preview)
         (
-            "https://huggingface.co/madebyollin/taeltx2/resolve/main/taeltx2_3.safetensors",
+            "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/vae/taeltx2_3.safetensors",
             "vae",
             config.tiny_vae,
         ),
         # Upscaler
         (
-            "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+            "https://huggingface.co/vidfom/aimusic/resolve/main/ComfyUI/models/latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
             "latent_upscale_models",
             config.upscaler_model,
         ),
@@ -928,30 +932,41 @@ def download_models(config: LTX23Config) -> None:
         ),
         # Text encoder 2 (LTX text projection)
         (
-            "https://huggingface.co/unsloth/LTX-2.3-GGUF/resolve/main/text_encoders/ltx-2.3_text_projection_bf16.safetensors",
+            "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/text_encoders/ltx-2.3_text_projection_bf16.safetensors",
             "text_encoders",
             config.text_encoder_2,
         ),
         # LoRAs
         (
-            "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors",
+            "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors",
             "loras",
             config.lora_1_name,
         ),
         (
-            "https://huggingface.co/whatdreamscost/LTX-2.3-OmniNFT-RL-Lora/resolve/main/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors",
+            "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors",
             "loras",
             config.lora_2_name,
         ),
         (
-            "https://huggingface.co/whatdreamscost/ltx2.3-transition/resolve/main/ltx2.3-transition.safetensors",
+            "https://huggingface.co/joyfox/LTX-2.3-Transition-LORA/resolve/main/ltx2.3-transition.safetensors",
             "loras",
             config.lora_3_name,
         ),
         (
-            "https://huggingface.co/whatdreamscost/LTX2.3-MVCamera-drclips/resolve/main/LTX2.3-MVCamera-drclips.safetensors",
+            "https://huggingface.co/vidfom/aimusic/resolve/main/ComfyUI/models/loras/LTX2.3-MVCamera-drclips.safetensors",
             "loras",
             config.lora_4_name,
+        ),
+        # Additional LoRAs
+        (
+            "https://huggingface.co/vrgamedevgirl84/LTX_2.3_Crisp_Enhance_Style_LoRa/resolve/main/LTX2.3_Crisp_Enhance.safetensors",
+            "loras",
+            "LTX2.3_Crisp_Enhance.safetensors",
+        ),
+        (
+            "https://huggingface.co/LiconStudio/LTX-2.3-Multiple-Subject-Reference/resolve/main/LTX-2.3-Licon-MSR-V2.safetensors",
+            "loras",
+            "LTX-2.3-Licon-MSR-V2.safetensors",
         ),
     ]
 
@@ -3260,6 +3275,95 @@ def main() -> None:
 
 
 # =============================================================================
+# COLAB CELL: SETUP & DOWNLOAD MODELS
+# =============================================================================
+# @title ⚙️ Setup & Download Models (run once)
+def setup_and_download_models_cell():
+    """
+    Colab cell function: installs dependencies, clones custom nodes, and
+    downloads all required models. Run this once before generation.
+    """
+    import os
+    import subprocess
+    from pathlib import Path
+
+    print('[1/3] Installing dependencies...')
+    _run_cmd(
+        "pip install -q torch torchvision torchaudio einops diffusers accelerate "
+        "av spandrel albumentations onnx opencv-python onnxruntime tqdm ipywidgets",
+        "Installing Python packages"
+    )
+    if not os.path.exists('/content/ComfyUI'):
+        _run_cmd("git clone -q https://github.com/comfyanonymous/ComfyUI /content/ComfyUI", "Cloning ComfyUI")
+    _run_cmd("pip install -q -r /content/ComfyUI/requirements.txt", "Installing ComfyUI requirements")
+    _run_cmd("apt-get -y install -qq aria2 > /dev/null 2>&1", "Installing aria2")
+
+    print('[2/3] Cloning custom nodes...')
+    custom_nodes_dir = "/content/ComfyUI/custom_nodes"
+    os.makedirs(custom_nodes_dir, exist_ok=True)
+    nodes = [
+        "https://github.com/comfy-org/ComfyUI-Manager",
+        "https://github.com/WhatDreamscost/WhatDreamsCost-ComfyUI",
+        "https://github.com/rgthree/rgthree-comfy",
+        "https://github.com/liconstudio/ComfyUI-Licon-MSR",
+        "https://github.com/kijai/ComfyUI-KJNodes",
+        "https://github.com/city96/ComfyUI-GGUF",
+        "https://github.com/Lightricks/ComfyUI-LTXVideo/",
+        "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
+        "https://github.com/kijai/ComfyUI-MelBandRoFormer",
+    ]
+    for node in nodes:
+        name = node.rstrip('/').split('/')[-1]
+        node_path = os.path.join(custom_nodes_dir, name)
+        if not os.path.exists(node_path):
+            _run_cmd(f"git clone -q {node} {node_path}", f"Cloning {name}")
+            req = os.path.join(node_path, "requirements.txt")
+            if os.path.exists(req):
+                _run_cmd(f"pip install -q -r {req}", f"Installing {name} requirements")
+
+    print('[3/3] Downloading models...')
+
+    def dl(url, dest, fname):
+        Path(dest).mkdir(parents=True, exist_ok=True)
+        fp = os.path.join(dest, fname)
+        if not os.path.exists(fp):
+            subprocess.run(
+                ['aria2c', '--console-log-level=error', '-c', '-x', '16',
+                 '-s', '16', '-k', '1M', '-d', dest, '-o', fname, url],
+                check=True
+            )
+
+    dl("https://huggingface.co/vantagewithai/LTX-2.3-GGUF/resolve/main/dev/ltx-2-3-22b-dev-Q4_K_M.gguf",
+       "/content/ComfyUI/models/unet", "ltx-2-3-22b-dev-Q4_K_M.gguf")
+    dl("https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors",
+       "/content/ComfyUI/models/text_encoders", "gemma_3_12B_it_fp4_mixed.safetensors")
+    dl("https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/text_encoders/ltx-2.3_text_projection_bf16.safetensors",
+       "/content/ComfyUI/models/text_encoders", "ltx-2.3_text_projection_bf16.safetensors")
+    dl("https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/vae/LTX23_audio_vae_bf16.safetensors",
+       "/content/ComfyUI/models/vae", "LTX23_audio_vae_bf16.safetensors")
+    dl("https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/vae/LTX23_video_vae_bf16.safetensors",
+       "/content/ComfyUI/models/vae", "LTX23_video_vae_bf16.safetensors")
+    dl("https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/vae/taeltx2_3.safetensors",
+       "/content/ComfyUI/models/vae", "taeltx2_3.safetensors")
+    dl("https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors",
+       "/content/ComfyUI/models/loras", "ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors")
+    dl("https://huggingface.co/joyfox/LTX-2.3-Transition-LORA/resolve/main/ltx2.3-transition.safetensors",
+       "/content/ComfyUI/models/loras", "ltx2.3-transition.safetensors")
+    dl("https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors",
+       "/content/ComfyUI/models/loras", "LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors")
+    dl("https://huggingface.co/vrgamedevgirl84/LTX_2.3_Crisp_Enhance_Style_LoRa/resolve/main/LTX2.3_Crisp_Enhance.safetensors",
+       "/content/ComfyUI/models/loras", "LTX2.3_Crisp_Enhance.safetensors")
+    dl("https://huggingface.co/LiconStudio/LTX-2.3-Multiple-Subject-Reference/resolve/main/LTX-2.3-Licon-MSR-V2.safetensors",
+       "/content/ComfyUI/models/loras", "LTX-2.3-Licon-MSR-V2.safetensors")
+    dl("https://huggingface.co/vidfom/aimusic/resolve/main/ComfyUI/models/latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+       "/content/ComfyUI/models/latent_upscale_models", "ltx-2.3-spatial-upscaler-x2-1.1.safetensors")
+    dl("https://huggingface.co/vidfom/aimusic/resolve/main/ComfyUI/models/loras/LTX2.3-MVCamera-drclips.safetensors",
+       "/content/ComfyUI/models/loras", "LTX2.3-MVCamera-drclips.safetensors")
+
+    print('Setup complete! Run the generation cell to generate.')
+
+
+# =============================================================================
 # COLAB CELL HELPER FUNCTIONS
 # =============================================================================
 def run_test_generation() -> Optional[str]:
@@ -3358,6 +3462,47 @@ def display_video_in_colab(video_path: str) -> None:
     except Exception as e:
         logger.warning(f"[Display] Could not display video: {e}")
         logger.info(f"[Display] Video saved at: {video_path}")
+
+
+# =============================================================================
+# COLAB UI PARAMETERS (Interactive Controls)
+# =============================================================================
+# @markdown ### LoRA Configuration
+use_lora_distilled = True  # @param {type:"boolean"}
+lora_distilled_strength = 0.4  # @param {"type":"slider","min":0,"max":2,"step":0.01}
+use_lora_omninft = True  # @param {type:"boolean"}
+lora_omninft_strength = 0.6  # @param {"type":"slider","min":0,"max":2,"step":0.01}
+use_lora_transition = True  # @param {type:"boolean"}
+lora_transition_strength = 0.7  # @param {"type":"slider","min":0,"max":2,"step":0.01}
+use_lora_mvcamera = True  # @param {type:"boolean"}
+lora_mvcamera_strength = 0.9  # @param {"type":"slider","min":0,"max":2,"step":0.01}
+
+# @markdown ### Sampling Settings
+pass1_steps = 8  # @param {"type":"integer"}
+pass1_denoise = 1.0  # @param {"type":"slider","min":0,"max":1,"step":0.01}
+pass2_steps = 4  # @param {"type":"integer"}
+pass2_denoise = 0.42  # @param {"type":"slider","min":0,"max":1,"step":0.01}
+scheduler_name = "linear_quadratic"  # @param ["linear_quadratic", "normal", "simple", "ddim_uniform", "sgm_uniform"]
+sampler_name = "euler"  # @param ["euler", "euler_ancestral", "dpmpp_2m", "dpmpp_sde"]
+
+
+def build_config_from_ui_params() -> 'LTX23Config':
+    """Build an LTX23Config using the Colab UI parameter values above."""
+    config = LTX23Config(
+        lora_1_strength=lora_distilled_strength if use_lora_distilled else 0.0,
+        lora_2_strength=lora_omninft_strength if use_lora_omninft else 0.0,
+        lora_3_strength=lora_transition_strength if use_lora_transition else 0.0,
+        lora_4_strength=lora_mvcamera_strength if use_lora_mvcamera else 0.0,
+        stage1_steps=pass1_steps,
+        stage1_denoise=pass1_denoise,
+        stage2_steps=pass2_steps,
+        stage2_denoise=pass2_denoise,
+        stage1_scheduler=scheduler_name,
+        stage2_scheduler=scheduler_name,
+        stage1_sampler=sampler_name,
+        stage2_sampler=sampler_name,
+    )
+    return config
 
 
 # =============================================================================
