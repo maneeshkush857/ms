@@ -1,0 +1,29 @@
+{
+  "id": "FEAT-003",
+  "type": "fix",
+  "description": "Fix argparse crash in Colab by using parse_known_args, add all missing @param controls, make entry point Colab-aware",
+  "status": "in_progress",
+  "steps": [
+    "1. Replace parser.parse_args() with parser.parse_known_args() in main()",
+    "2. Add detection for Colab/Jupyter environment (check 'google.colab' in sys.modules or 'ipykernel' in sys.modules)",
+    "3. Add missing @param controls: seed, width, height, frames, fps, test_mode, project_dir, comfyui_dir, skip_setup, skip_download, use_chunked",
+    "4. Update build_config_from_ui_params() to incorporate all settings",
+    "5. Make entry point detect Colab and use UI params instead of argparse"
+  ],
+  "acceptance_criteria": [
+    "parser.parse_args() replaced with parse_known_args() as safety net",
+    "Colab detection logic present using sys.modules check",
+    "All missing @param controls added (seed, width, height, frames, fps, test_mode, project_dir, comfyui_dir, skip_setup, skip_download, use_chunked)",
+    "build_config_from_ui_params() uses all @param values",
+    "Entry point detects Colab and calls pipeline with UI params instead of argparse",
+    "File passes Python syntax check"
+  ],
+  "verification": [
+    "python3 -c \"import ast; ast.parse(open('/projects/ms/LTX23_Director_2_0_MV_Colab.py').read()); print('Syntax OK')\"",
+    "grep 'parse_known_args' /projects/ms/LTX23_Director_2_0_MV_Colab.py",
+    "grep 'google.colab' /projects/ms/LTX23_Director_2_0_MV_Colab.py",
+    "grep '@param' /projects/ms/LTX23_Director_2_0_MV_Colab.py | wc -l"
+  ],
+  "blocked_reason": null,
+  "findings": null
+}

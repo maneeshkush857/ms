@@ -3150,7 +3150,7 @@ def main() -> None:
         help="Disable chunked generation (process all frames at once)"
     )
 
-    args = parser.parse_args()
+    args, _unknown = parser.parse_known_args()
 
     # --- Build configuration ---
     config = LTX23Config(
@@ -3467,6 +3467,23 @@ def display_video_in_colab(video_path: str) -> None:
 # =============================================================================
 # COLAB UI PARAMETERS (Interactive Controls)
 # =============================================================================
+# @markdown ### General Settings
+seed = 0  # @param {"type":"integer"}
+width = 1280  # @param {"type":"integer"}
+height = 720  # @param {"type":"integer"}
+frames = 756  # @param {"type":"integer"}
+fps = 24  # @param {"type":"integer"}
+test_mode = False  # @param {type:"boolean"}
+
+# @markdown ### Paths
+project_dir = "/content/LTX23_Project"  # @param {"type":"string"}
+comfyui_dir = "/content/ComfyUI"  # @param {"type":"string"}
+
+# @markdown ### Pipeline Options
+skip_setup = False  # @param {type:"boolean"}
+skip_download = False  # @param {type:"boolean"}
+use_chunked = True  # @param {type:"boolean"}
+
 # @markdown ### LoRA Configuration
 use_lora_distilled = True  # @param {type:"boolean"}
 lora_distilled_strength = 0.4  # @param {"type":"slider","min":0,"max":2,"step":0.01}
@@ -3486,9 +3503,35 @@ scheduler_name = "linear_quadratic"  # @param ["linear_quadratic", "normal", "si
 sampler_name = "euler"  # @param ["euler", "euler_ancestral", "dpmpp_2m", "dpmpp_sde"]
 
 
+def is_colab_or_jupyter() -> bool:
+    """Detect if running inside Google Colab or Jupyter notebook."""
+    try:
+        if 'google.colab' in sys.modules:
+            return True
+        if 'ipykernel' in sys.modules:
+            return True
+        from IPython import get_ipython
+        if get_ipython() is not None:
+            return True
+    except (ImportError, NameError):
+        pass
+    return False
+
+
 def build_config_from_ui_params() -> 'LTX23Config':
     """Build an LTX23Config using the Colab UI parameter values above."""
     config = LTX23Config(
+        seed=seed,
+        width=width,
+        height=height,
+        total_frames=frames,
+        frame_rate=fps,
+        test_mode=test_mode,
+        project_dir=project_dir,
+        comfyui_dir=comfyui_dir,
+        output_dir=os.path.join(project_dir, "output"),
+        chunks_dir=os.path.join(project_dir, "chunks"),
+        state_file=os.path.join(project_dir, "generation_state.json"),
         lora_1_strength=lora_distilled_strength if use_lora_distilled else 0.0,
         lora_2_strength=lora_omninft_strength if use_lora_omninft else 0.0,
         lora_3_strength=lora_transition_strength if use_lora_transition else 0.0,
@@ -3505,8 +3548,117 @@ def build_config_from_ui_params() -> 'LTX23Config':
     return config
 
 
+def run_from_ui_params() -> None:
+    """
+    Run the pipeline using Colab UI @param values instead of argparse.
+    Called when running inside Google Colab or Jupyter where argparse fails.
+    """
+    config = build_config_from_ui_params()
+
+    # --- Display configuration ---
+    logger.info("\n" + "=" * 60)
+    logger.info("LTX-2.3 DIRECTOR 2.0 MUSIC VIDEO PIPELINE (Colab UI Mode)")
+    logger.info("=" * 60)
+    logger.info(f"  Resolution: {config.width}x{config.height}")
+    logger.info(f"  Frame Rate: {config.frame_rate} fps")
+    logger.info(f"  Duration: {config.duration}s ({config.total_frames} frames)")
+    logger.info(f"  Seed: {config.seed} (mode: {config.noise_mode})")
+    logger.info(f"  Test Mode: {config.test_mode}")
+    logger.info(f"  Project Dir: {config.project_dir}")
+    logger.info(f"  ComfyUI Dir: {config.comfyui_dir}")
+    logger.info(f"  Stage 1: {config.stage1_steps} steps, denoise={config.stage1_denoise}, "
+                f"guide={config.stage1_guide_strength}")
+    logger.info(f"  Stage 2: {config.stage2_steps} steps, denoise={config.stage2_denoise}, "
+                f"guide={config.stage2_guide_strength}")
+    logger.info(f"  LoRAs: [{config.lora_1_strength}, {config.lora_2_strength}, "
+                f"{config.lora_3_strength}, {config.lora_4_strength}]")
+    logger.info("=" * 60)
+
+    # --- Step 1: Environment Setup ---
+    if not skip_setup:
+        setup_environment(config)
+    else:
+        logger.info("[Main] Skipping environment setup")
+        if config.comfyui_dir not in sys.path:
+            sys.path.insert(0, config.comfyui_dir)
+
+    # --- Step 2: Download Models ---
+    if not skip_download:
+        download_models(config)
+        download_assets(config)
+    else:
+        logger.info("[Main] Skipping model downloads")
+
+    # --- Step 3: Pre-flight Checks ---
+    preflight_ok = preflight_checks(config)
+    if not preflight_ok:
+        logger.error("[Main] Pre-flight checks failed! Continuing anyway...")
+
+    # --- Step 4: Import Custom Nodes ---
+    logger.info("[Main] Importing custom nodes...")
+    import_custom_nodes()
+
+    # --- Step 5: Parse Timeline ---
+    logger.info("[Main] Parsing timeline...")
+    timeline = parse_timeline(config.timeline_data)
+
+    # --- Step 6: Execute Pipeline ---
+    start_time = time.time()
+    output_path: Optional[str] = None
+
+    if not use_chunked or config.test_mode:
+        # Direct non-chunked mode (for test mode or small generation)
+        logger.info("[Main] Using direct (non-chunked) pipeline")
+        direct = LTX23DirectPipeline(config)
+        output_path = direct.run()
+    else:
+        # Chunked mode (default for full generation)
+        logger.info("[Main] Using chunked pipeline with checkpoint/resume")
+        pipeline = LTX23DirectorPipeline(config)
+        output_path = pipeline.run()
+
+    # --- Step 7: Report Results ---
+    elapsed = time.time() - start_time
+    logger.info("\n" + "=" * 60)
+    logger.info("GENERATION COMPLETE")
+    logger.info("=" * 60)
+
+    if output_path and os.path.exists(output_path):
+        file_size = os.path.getsize(output_path) / (1024 * 1024)
+        logger.info(f"  Output: {output_path}")
+        logger.info(f"  File size: {file_size:.1f} MB")
+        logger.info(f"  Total time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
+        logger.info("  Status: SUCCESS")
+    else:
+        logger.error(f"  Status: FAILED")
+        logger.error(f"  Total time: {elapsed:.1f}s")
+        if output_path:
+            logger.error(f"  Expected output: {output_path}")
+
+    logger.info("=" * 60)
+
+    # Display in Colab if available
+    try:
+        from IPython.display import display, HTML
+        if output_path and os.path.exists(output_path):
+            display(HTML(f"""
+            <div style="padding: 10px; background: #1a1a2e; border-radius: 8px;">
+                <h3 style="color: #e94560;">Video Generated Successfully!</h3>
+                <p style="color: #ccc;">Output: {output_path}</p>
+                <p style="color: #ccc;">Size: {file_size:.1f} MB | Time: {elapsed:.1f}s</p>
+            </div>
+            """))
+    except ImportError:
+        pass
+
+
 # =============================================================================
 # ENTRY POINT
 # =============================================================================
 if __name__ == "__main__":
-    main()
+    if is_colab_or_jupyter():
+        # Running in Colab/Jupyter: use UI @param values (avoids argparse crash)
+        run_from_ui_params()
+    else:
+        # Running from command line: use argparse
+        main()
