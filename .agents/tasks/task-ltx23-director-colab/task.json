@@ -2,7 +2,7 @@
   "task_id": "task-ltx23-director-colab",
   "task_description": "Create LTX23_Director_2_0_MV_Colab.py - a complete production-quality Python implementation that executes the LTX-2.3 Director 2.0 MV Workflow inside Google Colab/ComfyUI on Tesla T4 with memory-managed chunked generation, two-stage sampling, checkpoint/resume, and FFmpeg assembly",
   "status": "completed",
-  "feature_order": ["FEAT-001", "FEAT-002"],
+  "feature_order": ["FEAT-001", "FEAT-002", "FEAT-003"],
   "blocked_reason": null,
   "verification": {
     "build": "pass",
