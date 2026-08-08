@@ -661,6 +661,13 @@ def _install_custom_nodes():
         ("https://github.com/rgthree/rgthree-comfy",               "rgthree-comfy"),
     ]
 
+    # FIX 2 — Pin kornia to <0.7.0 BEFORE installing any custom node requirements.
+    # ComfyUI-LTXVideo (and potentially others) use kornia's pyramid module.
+    # In kornia >= 0.7.0 the 'pad' symbol was removed/renamed, breaking:
+    #   "from kornia.geometry.transform.pyramid import pad"
+    # Pinning here ensures the correct version survives later pip installs.
+    _run("pip install -q --force-reinstall 'kornia==0.6.12'", "kornia pin (< 0.7.0)")
+
     for url, name in REQUIRED_NODES:
         dest = os.path.join(nodes_dir, name)
         if not os.path.exists(dest):
@@ -685,6 +692,38 @@ def setup_comfyui():
         sys.path.insert(0, comfyui_dir)
     print(f"  ComfyUI path: {comfyui_dir}")
 
+def _init_prompt_server():
+    """
+    FIX 1 — PromptServer.instance stub for headless / script mode.
+
+    Many custom nodes (rgthree-comfy, ComfyUI-VideoHelperSuite,
+    ComfyUI-Manager, WhatDreamsCost-ComfyUI) access
+    `PromptServer.instance` at module *import* time to register HTTP
+    routes.  In script mode the full ComfyUI server loop is never
+    started, so the attribute does not exist and every affected custom
+    node throws:
+        AttributeError: type object 'PromptServer' has no attribute 'instance'
+
+    Workaround: create a minimal PromptServer on a dedicated asyncio
+    loop *before* calling init_external_custom_nodes.  This sets
+    PromptServer.instance and gives the route-registration calls a
+    real (but never-started) aiohttp Application to write into, so
+    they complete without error.
+
+    Reference: ComfyUI server.py – PromptServer.__init__ sets
+    `PromptServer.instance = self` unconditionally.
+    """
+    try:
+        import server as comfy_server
+        if hasattr(comfy_server.PromptServer, "instance") and comfy_server.PromptServer.instance is not None:
+            return  # already initialised
+        _ps_loop = asyncio.new_event_loop()
+        comfy_server.PromptServer(_ps_loop)   # sets PromptServer.instance
+        print("  ✓ PromptServer stub initialised (headless mode).")
+    except Exception as e:
+        print(f"  ⚠ PromptServer stub failed ({e}) — some custom nodes may be unavailable.")
+
+
 def import_custom_nodes():
     """Load all built-in and external custom nodes (Colab/Jupyter safe)."""
     global _NODES_LOADED
@@ -692,6 +731,10 @@ def import_custom_nodes():
         return
     import nest_asyncio
     nest_asyncio.apply()
+
+    # Must run BEFORE init_external_custom_nodes so custom nodes that
+    # call PromptServer.instance at import time don't crash.
+    _init_prompt_server()
 
     from nodes import init_builtin_extra_nodes, init_external_custom_nodes
 
@@ -1345,14 +1388,36 @@ def get_conditioning_on_device(pos_cond, neg_cond):
 # SECTION 13 — MODEL LOADING (DiT, VAEs, Upscaler, LoRAs)
 # =============================================================================
 
-# Weak model references to avoid accidental duplication
-_MODEL_CACHE: Dict[str, Any] = {}
+# =============================================================================
+# SECTION 13 — MODEL LOADING (DiT, VAEs, Upscaler, LoRAs)
+# =============================================================================
+
+# ── DiT model singleton cache ────────────────────────────────────────────────
+# FIX 3: The 22B GGUF DiT model + 4 LoRAs occupies ~14 GB of VRAM.
+# Loading it fresh on every chunk (or every sampling pass) immediately causes
+# OOM because the previous copy is still resident while the new one is loaded.
+#
+# Solution: load once, keep alive across all chunks, release only at the end.
+# The cache is a plain list so the object can be mutated (set to None) to
+# release the reference, which then allows GC/CUDA to free the memory.
+_DIT_MODEL_CACHE: List[Any] = [None]   # [0] = model or None
 
 
-def load_dit_model(apply_loras: bool = True) -> Any:
+def load_dit_model(apply_loras: bool = True, force_reload: bool = False) -> Any:
     """
-    Load the LTX-2.3 22B GGUF DiT model (workflow node 135 — UnetLoaderGGUF)
-    and apply all 4 LoRAs at workflow strengths.
+    FIX 3 — Load the LTX-2.3 22B GGUF DiT model exactly ONCE per runtime.
+
+    Subsequent calls return the already-loaded model from the module-level
+    singleton cache.  This prevents the two failure modes seen in the error log:
+
+    a) Loading a fresh 14 GB tensor when the existing one is still live
+       → immediate CUDA OOM during LoRA application.
+
+    b) Repeated LoRA patching on an already-patched model
+       → weight drift and VRAM double-counting.
+
+    Set force_reload=True only if you need a fresh model (e.g. after
+    release_dit_model() and a full CUDA cleanup).
 
     LoRA application order (from JSON PowerLoraLoader node):
         1. lora_distilled  strength=0.4
@@ -1360,6 +1425,10 @@ def load_dit_model(apply_loras: bool = True) -> Any:
         3. lora_transition strength=0.7
         4. lora_mvcamera   strength=0.9
     """
+    if _DIT_MODEL_CACHE[0] is not None and not force_reload:
+        print("  ✓ DiT model (from cache — not reloading)")
+        return _DIT_MODEL_CACHE[0]
+
     print("  Loading DiT model (UnetLoaderGGUF)...")
     mem.cleanup()
 
@@ -1370,7 +1439,6 @@ def load_dit_model(apply_loras: bool = True) -> Any:
     mem.soft_cleanup()
 
     if apply_loras:
-        # Import LoraLoaderModelOnly from ComfyUI nodes
         from nodes import LoraLoaderModelOnly
         lora_loader = LoraLoaderModelOnly()
 
@@ -1386,11 +1454,28 @@ def load_dit_model(apply_loras: bool = True) -> Any:
             if os.path.exists(lora_path):
                 print(f"  Applying LoRA: {fname}  strength={strength}")
                 model = lora_loader.load_lora_model_only(model, fname, strength)[0]
+                # Flush cache after each LoRA to prevent OOM during patching
+                gc.collect()
+                torch.cuda.empty_cache()
             else:
                 print(f"  ⚠ LoRA not found, skipping: {fname}")
 
-    print("  ✓ DiT model ready.")
+    _DIT_MODEL_CACHE[0] = model
+    print(f"  ✓ DiT model ready.  GPU free after load: {mem.gpu_free_gb():.2f} GB")
     return model
+
+
+def release_dit_model():
+    """
+    Explicitly release the DiT model from the singleton cache.
+    Call this only after ALL chunks are complete and before
+    the VAE decode phase (which needs free VRAM).
+    """
+    if _DIT_MODEL_CACHE[0] is not None:
+        mem.safe_model_unload(_DIT_MODEL_CACHE[0], "DiT model")
+        _DIT_MODEL_CACHE[0] = None
+        mem.aggressive_cleanup()
+        print(f"  ✓ DiT released.  GPU free: {mem.gpu_free_gb():.2f} GB")
 
 
 def load_video_vae() -> Any:
@@ -1503,39 +1588,38 @@ def build_director_conditioning(
     fps: int,
     width: int,
     height: int,
+    dit_model_preloaded=None,
     segment_images: Optional[List[str]] = None,
     segment_prompts: Optional[List[str]] = None,
 ) -> Tuple:
     """
     Run the LTXDirector node (workflow node 131) when available.
-    This is the WhatDreamsCost Director node that builds multi-segment timeline
-    conditioning with image, audio and motion guide data.
+    ...
 
-    If LTXDirector is not available in NODE_CLASS_MAPPINGS, falls back gracefully
-    to standard LTX conditioning (single-image path) and logs the missing node.
-
+    FIX 6 — Accepts pre-loaded dit_model_preloaded so this function never
+    calls load_dit_model() itself (which would trigger a second 14 GB load
+    on top of the already-resident model).
+    ...
     Returns:
         (director_model_passthrough, pos_cond_out, neg_cond_out,
          guide_data, motion_guide_data, audio_latent, frame_rate_signal)
     """
     from nodes import NODE_CLASS_MAPPINGS
 
+    # Use the pre-loaded model; fall back to singleton cache only if caller
+    # forgot to pass it (should not normally happen)
+    dit_model = dit_model_preloaded if dit_model_preloaded is not None else load_dit_model()
+
     # ── LTXDirector path (WhatDreamsCost) ────────────────────────────────────
     if "LTXDirector" in NODE_CLASS_MAPPINGS:
         print("  Using LTXDirector (WhatDreamsCost) node...")
-
-        # Load models needed by Director
-        dit_model = load_dit_model(apply_loras=True)
         audio_vae = load_audio_vae()
 
         director = NODE_CLASS_MAPPINGS["LTXDirector"]()
 
-        # Build timeline_data for this chunk — simplified from workflow JSON
-        # The full 5-segment timeline is in GLOBAL_PROMPT; for chunked generation
-        # we pass the segment images/prompts that fall within this chunk.
         timeline_kwargs = dict(
             model=dit_model,
-            clip=None,          # CLIP already encoded — conditioning passed directly
+            clip=None,
             audio_vae=get_value_at_index((audio_vae,), 0),
             global_prompt=GLOBAL_PROMPT,
         )
@@ -1543,7 +1627,6 @@ def build_director_conditioning(
         try:
             director_out = director.execute(**timeline_kwargs)
         except TypeError:
-            # Signature varies across Director versions — try positional
             director_out = director.execute(
                 dit_model, None, audio_vae, GLOBAL_PROMPT
             )
@@ -1560,7 +1643,6 @@ def build_director_conditioning(
 
     # ── Fallback: standard conditioning (no LTXDirector node) ────────────────
     print("  ⚠ LTXDirector node not found — using standard conditioning fallback.")
-    dit_model = load_dit_model(apply_loras=True)
     audio_vae = load_audio_vae()
 
     ltxvemptylatentaudio = get_node("LTXVEmptyLatentAudio")
@@ -2042,9 +2124,19 @@ def generate_chunk(
     fps: int,
     profile: Dict,
     global_seed: int,
+    dit_model=None,        # FIX 4: accept pre-loaded model; never load inside chunk
 ) -> Dict:
     """
     Generate one temporal chunk using the full LTX-2.3 Director 2.0 pipeline.
+
+    FIX 4 — DiT model is loaded ONCE outside the chunk loop in
+    generate_director_mv() and passed in here as `dit_model`.  This
+    avoids loading a fresh 14 GB tensor every chunk (and on top of
+    the previous one during the LoRA-application OOM seen in the logs).
+
+    FIX 5 — VAE and upscaler are explicitly offloaded to CPU (then
+    deleted) between Pass 1 and Pass 2 to free the ~2–3 GB they
+    occupy so Pass 2 sampling has room.
 
     Pipeline (mirrors workflow JSON):
         1.  Pre-process image for this chunk
@@ -2054,16 +2146,17 @@ def generate_chunk(
         5.  Sampling pass 1  (Euler, 8 steps, linear_quadratic)
         6.  Separate AV latent
         7.  LTXDirectorCropGuides
-        8.  2× latent upscale
-        9.  Re-condition image on upscaled latent
-        10. Apply LTXDirectorGuide pass 2 conditioning
-        11. Sampling pass 2  (Euler, 8 steps, linear_quadratic)
-        12. Separate AV latent (final)
-        13. VAE decode video
-        14. VAE decode audio
-        15. Save chunk to disk
-        16. Release all GPU tensors
-        17. Return lightweight metadata dict
+        8.  Offload VAE + upscaler to CPU                      ← FIX 5
+        9.  2× latent upscale
+        10. Re-condition image on upscaled latent
+        11. Apply LTXDirectorGuide pass 2 conditioning
+        12. Sampling pass 2  (Euler, 8 steps, linear_quadratic)
+        13. Separate AV latent (final)
+        14. Reload VAE for decode
+        15. VAE decode video + audio
+        16. Save chunk to disk
+        17. Release all GPU tensors
+        18. Return lightweight metadata dict
 
     Returns dict with keys: chunk_index, start_frame, num_frames, fps, path.
     Never returns GPU tensors.
@@ -2079,30 +2172,31 @@ def generate_chunk(
     if CONFIG["enable_memory_logging"]:
         print(f"\n  GPU before chunk {idx}: {mem.gpu_free_gb():.2f} GB free")
 
+    # FIX 4: Use provided model; fall back to singleton cache if caller omits it
+    if dit_model is None:
+        dit_model = load_dit_model(apply_loras=True)
+
     with torch.inference_mode():
         # ── 1. Image preprocessing ────────────────────────────────────────────
         preprocessed, latent_w, latent_h = prepare_image_for_chunk(
             loaded_image_tuple, width, height, img_compress, longer_edge
         )
 
-        # ── 2. Load VAEs ──────────────────────────────────────────────────────
+        # ── 2. Load video VAE (audio VAE loaded once for audio latent creation)
         video_vae = load_video_vae()
         audio_vae = load_audio_vae()
 
-        # ── 3. Load DiT + LoRAs ───────────────────────────────────────────────
-        dit_model = load_dit_model(apply_loras=True)
-
-        # ── 4. Load upscaler ─────────────────────────────────────────────────
+        # ── 3. Load upscaler ──────────────────────────────────────────────────
         upscaler = load_upscaler_model()
 
-        # ── 5. Build empty latents ────────────────────────────────────────────
+        # ── 4. Build empty latents ────────────────────────────────────────────
         av_latent_pass1, img_conditioned_lat = build_empty_latents(
             num_frames, latent_w, latent_h, fps,
             preprocessed, image_strength, image_bypass,
             video_vae, audio_vae,
         )
 
-        # ── 6. LTXDirectorGuide pass 1 (workflow node 133: upscale_factor=0.5) ─
+        # ── 5. LTXDirectorGuide pass 1 (workflow node 133: upscale_factor=0.5)
         pos_g1, neg_g1, lat_g1, model_g1 = run_director_guide(
             pos_cond=pos_cond,
             neg_cond=neg_cond,
@@ -2115,7 +2209,7 @@ def generate_chunk(
             node_id="pass1",
         )
 
-        # ── 7. Sampling pass 1 ───────────────────────────────────────────────
+        # ── 6. Sampling pass 1 ────────────────────────────────────────────────
         sample_out_1 = run_sampling_pass(
             model=model_g1,
             pos_cond=pos_g1,
@@ -2131,24 +2225,56 @@ def generate_chunk(
         mem.cleanup()
         mem.warn_if_low()
 
-        # ── 8. Separate AV latent (workflow node 34) ──────────────────────────
+        # ── 7. Separate AV latent (workflow node 34) ──────────────────────────
         video_lat_p1, audio_lat_p1 = separate_av_latent(sample_out_1)
         del sample_out_1
         mem.soft_cleanup()
 
-        # ── 9. LTXDirectorCropGuides (workflow node 55) ───────────────────────
+        # ── 8. LTXDirectorCropGuides (workflow node 55) ───────────────────────
         pos_cropped, neg_cropped, video_lat_cropped = run_director_crop_guides(
             pos_cond, neg_cond, video_lat_p1
         )
         del video_lat_p1
         mem.soft_cleanup()
 
-        # ── 10. 2× latent spatial upscale (workflow node 14) ──────────────────
+        # ── FIX 5: Offload VAE + upscaler to CPU before 2× upsample ──────────
+        # After Pass 1, video_vae and audio_vae together hold ~2-3 GB.
+        # Offloading them here gives Pass 2 the headroom it needs.
+        if hasattr(video_vae, "to"):
+            try:
+                video_vae.to("cpu")
+            except Exception:
+                pass
+        if hasattr(audio_vae, "to"):
+            try:
+                audio_vae.to("cpu")
+            except Exception:
+                pass
+        # Upscaler is only needed for the upsample step; delete after
+        # (upscale runs below, then we immediately del upscaler)
+        mem.empty_cuda_cache()
+        gc.collect()
+        print(f"  VAEs offloaded.  GPU free: {mem.gpu_free_gb():.2f} GB")
+
+        # ── 9. 2× latent spatial upscale (workflow node 14) ───────────────────
+        # Bring video_vae back briefly for the upscaler (needs it for decode)
+        if hasattr(video_vae, "to"):
+            try:
+                video_vae.to(DEVICE)
+            except Exception:
+                pass
         upscaled_lat = upsample_video_latent(video_lat_cropped, upscaler, video_vae)
         del video_lat_cropped, upscaler
+        # Offload video_vae back to CPU again immediately
+        if hasattr(video_vae, "to"):
+            try:
+                video_vae.to("cpu")
+            except Exception:
+                pass
         mem.cleanup()
 
-        # ── 11. Re-condition image on upscaled latent + concat audio ──────────
+        # ── 10. Re-condition image on upscaled latent + concat audio ──────────
+        # Use CPU video_vae here (LTXVImgToVideoInplace works on CPU VAE)
         av_latent_pass2 = recondition_image_on_upscaled(
             upscaled_lat, preprocessed, image_strength, image_bypass,
             video_vae, audio_lat_p1,
@@ -2156,7 +2282,7 @@ def generate_chunk(
         del upscaled_lat, audio_lat_p1, preprocessed
         mem.soft_cleanup()
 
-        # ── 12. LTXDirectorGuide pass 2 (workflow node 132: upscale_factor=1) ─
+        # ── 11. LTXDirectorGuide pass 2 (workflow node 132: upscale_factor=1) ─
         pos_g2, neg_g2, lat_g2, model_g2 = run_director_guide(
             pos_cond=pos_cropped,
             neg_cond=neg_cropped,
@@ -2171,8 +2297,9 @@ def generate_chunk(
         del pos_cropped, neg_cropped, av_latent_pass2
         mem.cleanup()
         mem.warn_if_low()
+        print(f"  GPU before Pass2 sampling: {mem.gpu_free_gb():.2f} GB free")
 
-        # ── 13. Sampling pass 2 ───────────────────────────────────────────────
+        # ── 12. Sampling pass 2 ───────────────────────────────────────────────
         sample_out_2 = run_sampling_pass(
             model=model_g2,
             pos_cond=pos_g2,
@@ -2184,14 +2311,25 @@ def generate_chunk(
             pass_name=f"Pass2 (chunk {idx})",
         )
 
-        del pos_g2, neg_g2, lat_g2, model_g2, dit_model
+        del pos_g2, neg_g2, lat_g2, model_g2
         mem.cleanup()
 
-        # ── 14. Separate final AV latent (workflow node 22) ───────────────────
-        # Note: reference uses index 1 (denoised_output) for pass 2 output
+        # ── 13. Separate final AV latent (workflow node 22) ───────────────────
         final_video_lat, final_audio_lat = separate_av_latent(sample_out_2)
         del sample_out_2
         mem.soft_cleanup()
+
+        # ── 14. Reload video VAE on GPU for decode ────────────────────────────
+        if hasattr(video_vae, "to"):
+            try:
+                video_vae.to(DEVICE)
+            except Exception:
+                pass
+        if hasattr(audio_vae, "to"):
+            try:
+                audio_vae.to(DEVICE)
+            except Exception:
+                pass
 
         # ── 15. Decode video (CPU transfer happens inside) ────────────────────
         frames_cpu = decode_video_latent(final_video_lat, video_vae)
@@ -2201,7 +2339,7 @@ def generate_chunk(
         audio_cpu = decode_audio_latent(final_audio_lat, audio_vae)
         del final_audio_lat
 
-        # ── 17. Unload VAEs ───────────────────────────────────────────────────
+        # ── 17. Release VAEs ──────────────────────────────────────────────────
         del video_vae, audio_vae
         mem.cleanup()
 
@@ -2210,7 +2348,6 @@ def generate_chunk(
         frames_cpu, audio_cpu, idx, fps, width, height
     )
 
-    # Release CPU frame buffers
     del frames_cpu, audio_cpu
     gc.collect()
 
@@ -2246,6 +2383,7 @@ def adaptive_chunk_generator(
     profile: Dict,
     global_seed: int,
     checkpoint: Dict,
+    dit_model=None,       # FIX 4: receive pre-loaded model, pass into each chunk
 ) -> List[Dict]:
     """
     Iterate over chunks with OOM recovery and checkpoint-based resume.
@@ -2317,6 +2455,7 @@ def adaptive_chunk_generator(
                     fps=fps,
                     profile=profile,
                     global_seed=global_seed,
+                    dit_model=dit_model,   # FIX 4: pass pre-loaded model
                 )
 
                 completed.append(result)
@@ -2686,6 +2825,9 @@ def generate_preview(
     # Build conditioning
     pos_cond, neg_cond = build_text_conditioning(prompt, fps)
 
+    # Load DiT once for the preview
+    preview_dit = load_dit_model(apply_loras=True)
+
     # Single preview chunk
     preview_desc = {
         "chunk_index": 0,
@@ -2709,6 +2851,7 @@ def generate_preview(
             fps=fps,
             profile=profile,
             global_seed=seed,
+            dit_model=preview_dit,
         )
 
         # Move chunk to preview output location
@@ -2723,6 +2866,7 @@ def generate_preview(
 
     finally:
         del loaded_image, pos_cond, neg_cond
+        release_dit_model()
         _CONDITIONING_CACHE.clear()
         mem.aggressive_cleanup()
 
@@ -2995,6 +3139,16 @@ def generate_director_mv(
     mem.cleanup()
     pos_cond, neg_cond = build_text_conditioning(prompt, fps)
 
+    # ── FIX 4: Load DiT model ONCE before the chunk loop ─────────────────────
+    # The 22B GGUF + 4 LoRAs takes ~14 GB. Loading it inside each chunk (or
+    # twice per chunk for pass1+pass2) causes immediate OOM. Instead we load
+    # it here, pass it as a parameter to every chunk call, and release it only
+    # after all chunks complete and before the VAE decode phase.
+    print("\n  Pre-loading DiT model (once for all chunks)...")
+    mem.cleanup()
+    preloaded_dit = load_dit_model(apply_loras=True)
+    print(f"  GPU after DiT load: {mem.gpu_free_gb():.2f} GB free")
+
     # ── Main generation loop ──────────────────────────────────────────────────
     print(f"\n  Starting generation: {len(all_chunks)} chunks...")
     torch.cuda.reset_peak_memory_stats()
@@ -3012,9 +3166,11 @@ def generate_director_mv(
         profile=profile,
         global_seed=seed,
         checkpoint=checkpoint,
+        dit_model=preloaded_dit,    # FIX 4: single model for all chunks
     )
 
-    # Release conditioning and image — no longer needed
+    # Release DiT and conditioning — no longer needed after all chunks done
+    release_dit_model()
     del pos_cond, neg_cond, loaded_image
     _CONDITIONING_CACHE.clear()
     mem.aggressive_cleanup()
