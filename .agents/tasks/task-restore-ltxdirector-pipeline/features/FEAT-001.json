@@ -2,7 +2,7 @@
   "id": "FEAT-001",
   "type": "fix",
   "description": "Restore the LTXDirector pipeline in ltx23_director_mv_30s.py by: (1) fixing the git clone URL for WhatDreamsCost-ComfyUI, (2) adding its requirements install, (3) restoring the build_timeline_data function, (4) restoring multi-image upload, (5) replacing the standard-node workaround in Step 8 with the real LTXDirector node call, (6) restoring LTXDirectorGuide nodes for Steps 11 and 21, (7) restoring LTXDirectorCropGuides for Steps 19 and 28. Keep all other fixes (model_download always returns filename, upload functions write bytes directly, sequential LoraLoader, no ModelPreviewOverrideKJ).",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "In the custom_nodes setup section (~lines 40-53), replace the two comment lines ('# NOTE: rgthree-comfy no longer needed...' and '# NOTE: whatdreamscost-comfyui no longer needed...') with: '!git clone https://github.com/WhatDreamscost/WhatDreamsCost-ComfyUI.git'. Then add after the VideoHelperSuite requirements install: '# %cd /content/ComfyUI/custom_nodes/WhatDreamsCost-ComfyUI\\n!pip install -r requirements.txt'",
     "Restore the build_timeline_data() function (from commit 4feb2b8) after the upload_audio() function. This constructs the timeline_data JSON blob for LTXDirector with image segments, audio segments, global_prompt, retake config etc.",
@@ -52,5 +52,5 @@
     "grep -c 'ModelPreviewOverrideKJ' /projects/sandbox/ms/ltx23_director_mv_30s.py should be 0"
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "All 21 changes applied successfully. Syntax verified by stripping IPython magic commands before AST parsing (! and # % lines are Colab-specific). LTXDirector, LTXDirectorGuide, and LTXDirectorCropGuides nodes restored. Preserved fixes: model_download returns filename, upload functions write bytes directly, sequential LoraLoader, no ModelPreviewOverrideKJ in functional code."
 }
