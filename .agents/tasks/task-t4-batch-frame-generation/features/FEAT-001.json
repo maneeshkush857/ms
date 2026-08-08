@@ -1,0 +1,36 @@
+{
+  "id": "FEAT-001",
+  "type": "feat",
+  "description": "Add batch frame generation, T4 GPU memory management, and T4-compatible defaults to ltx23_director_mv_30s.py. This is a single coherent feature that transforms the script from A100-only to T4-compatible by: (1) adding batch_frames parameter with chunked generation loop, (2) lowering default resolution, (3) adding skip_pass2 option, (4) enhancing PYTORCH_CUDA_ALLOC_CONF, (5) more aggressive memory cleanup, and (6) updating comments/markdown to reflect T4 compatibility.",
+  "status": "in_progress",
+  "steps": [
+    "Step 1: Update the header comment/markdown at lines 7-11 to indicate T4 GPU compatibility (replace 'Requires A100 or L4' messaging with T4-compatible messaging). Update the @markdown comment at line 21-22 similarly.",
+    "Step 2: Enhance PYTORCH_CUDA_ALLOC_CONF at line 76 to include additional T4-optimized settings: 'expandable_segments:True,max_split_size_mb:256,garbage_collection_threshold:0.6'",
+    "Step 3: Add a new parameter 'batch_frames' (default 73) and 'skip_pass2' (default True for T4) to the mainLTXDirector function signature at line ~632. Also lower the default width to 832, height to 480, and frames to 97.",
+    "Step 4: Inside mainLTXDirector, after the LTXDirector node (Step 8) produces latents, implement a batch processing loop. The LTXDirectorGuide node already has 'max_frames' and 'overlap' parameters - set max_frames to the batch_frames value instead of the hardcoded 256. This is the key mechanism that controls how many frames are processed at once in the sampling loop. Set overlap to min(batch_frames//4, 16) frames for continuity between batches.",
+    "Step 5: Make Pass 2 (the refine/upscale pass, Steps 19-28) conditional on 'skip_pass2=False'. When skip_pass2=True, skip the upscale and pass 2 sampling entirely - go directly from Pass 1 output to VAE decode. This saves significant VRAM on T4.",
+    "Step 6: Add more aggressive memory cleanup: (a) After loading LoRAs (Step 3 section), delete the loraloader object. (b) After LTXDirector node output, delete the clip-related objects. (c) Between Pass 1 and Pass 2, add explicit cleanup of pass 1 intermediates. (d) Add torch.cuda.synchronize() before empty_cache() calls for more reliable cleanup.",
+    "Step 7: Update the Cell 6 user parameters section (line ~1090) to reflect T4 defaults: width=832, height=480, frames=97, add batch_frames=73, add skip_pass2=True. Add a comment explaining these are T4-optimized defaults. Pass the new parameters to mainLTXDirector call.",
+    "Step 8: Add a helper function 'get_t4_optimal_settings()' near the clear_memory() function that returns recommended settings dict for T4 (batch_frames=73, width=832, height=480, frames=97, skip_pass2=True, pass1_steps=6) with a print statement showing the settings when called."
+  ],
+  "acceptance_criteria": [
+    "The script parses without syntax errors (python -c 'import ast; ast.parse(...)')",
+    "mainLTXDirector function has batch_frames and skip_pass2 parameters",
+    "Default resolution is T4-compatible (832x480 or similar)",
+    "Default frames is reduced from 756 to 97 or similar T4-safe value",
+    "LTXDirectorGuide max_frames parameter uses batch_frames value instead of hardcoded 256",
+    "Pass 2 is conditional on skip_pass2 parameter",
+    "PYTORCH_CUDA_ALLOC_CONF includes max_split_size_mb and garbage_collection_threshold",
+    "Header comments reflect T4 compatibility",
+    "Cell 6 parameters pass batch_frames and skip_pass2 to mainLTXDirector"
+  ],
+  "verification": [
+    "Run: python -c \"import ast; ast.parse(open('/projects/sandbox/ms/ltx23_director_mv_30s.py').read()); print('Syntax OK')\"",
+    "Run: grep -n 'batch_frames' /projects/sandbox/ms/ltx23_director_mv_30s.py | head -20",
+    "Run: grep -n 'skip_pass2' /projects/sandbox/ms/ltx23_director_mv_30s.py | head -20",
+    "Run: grep -n 'max_split_size_mb' /projects/sandbox/ms/ltx23_director_mv_30s.py",
+    "Run: grep -n 'T4' /projects/sandbox/ms/ltx23_director_mv_30s.py | head -10"
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

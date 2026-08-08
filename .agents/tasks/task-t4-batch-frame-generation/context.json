@@ -1,0 +1,19 @@
+{
+  "project_type": "Google Colab notebook (Python script converted from .ipynb) for LTX-2.3 Director video generation",
+  "language": "Python",
+  "build_system": "None (Colab notebook - runs as script with pip installs inline)",
+  "test_framework": "None (no automated tests - manual Colab execution)",
+  "build_command": "python -c \"import ast; ast.parse(open('ltx23_director_mv_30s.py').read())\"",
+  "test_command": "python -c \"import ast; ast.parse(open('ltx23_director_mv_30s.py').read())\"",
+  "verification_instructions": "1. Run AST parse to verify syntax is valid. 2. Verify batch_frames parameter exists in mainLTXDirector. 3. Verify T4-compatible defaults (lower resolution, skip_pass2 option). 4. Verify memory management techniques are present.",
+  "snapshot_or_generated_files": null,
+  "setup_instructions": "No setup needed - this is a self-contained Python script for Google Colab",
+  "environment_constraints": "INTEGRATIONS_ONLY network - cannot install packages or run the actual pipeline. Validation limited to AST parsing and code inspection. The script runs on Colab with ComfyUI, not locally.",
+  "contribution_requirements": "Commit changes on feat/ltx23-director-colab-notebook branch. Do NOT push.",
+  "key_patterns": "The script uses ComfyUI NODE_CLASS_MAPPINGS to instantiate pipeline components. The mainLTXDirector function (line ~630) orchestrates a two-pass pipeline: Pass 1 (base sampling at 0.5x downscale) then Pass 2 (refine sampling at 1x). LTXDirectorGuide has max_frames and overlap parameters that control batching internally. Memory management uses del + torch.cuda.empty_cache() + gc.collect(). The reference script ltx2_ti2v_distilled.py generates 121 frames at 480p on T4.",
+  "relevant_files": [
+    "ltx23_director_mv_30s.py",
+    "ltx2_ti2v_distilled.py"
+  ],
+  "directory_structure": "Root contains: ltx23_director_mv_30s.py (main target file ~1180 lines), ltx2_ti2v_distilled.py (reference script for T4), LTX-2.3_Director_2.0-MV-Workflow-30s.json (ComfyUI workflow JSON)"
+}

@@ -1,0 +1,7 @@
+{
+  "task_id": "task-t4-batch-frame-generation",
+  "task_description": "Add batch frame generation and T4 GPU memory management to ltx23_director_mv_30s.py. The script currently tries to generate all 756 frames in a single pass causing OOM on T4 (16GB VRAM). Changes: batch_frames parameter, skip_pass2 option, lower default resolution, enhanced PYTORCH_CUDA_ALLOC_CONF, more aggressive memory cleanup, updated comments.",
+  "status": "in_progress",
+  "feature_order": ["FEAT-001"],
+  "blocked_reason": null
+}
