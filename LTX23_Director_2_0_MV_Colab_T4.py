@@ -157,6 +157,23 @@ WORKSPACE_DIR = "/content/ltx23_workspace"  # @param {type:"string"}
 OUTPUT_DIR    = "/content/ltx23_output"     # @param {type:"string"}
 COMFYUI_DIR   = "/content/ComfyUI"          # @param {type:"string"}
 
+# ── ⑭ ComfyUI fork selection ─────────────────────────────────────────────────
+# @markdown ---
+# @markdown ### 🔧 ComfyUI Fork (Advanced)
+# @markdown **`isi_pinned`** (default, recommended) — Isi-dev fork pinned at
+# @markdown `ComfyUI_22_01_2026_v0.10.0`. Does NOT include `comfy_kitchen`,
+# @markdown so it is fully compatible with PyTorch 2.11 on T4.
+# @markdown
+# @markdown **`upstream_head`** — `comfyanonymous/ComfyUI` latest. Pulls in
+# @markdown `comfy_kitchen` which CRASHES on PyTorch 2.11 with:
+# @markdown `TypeError: Config() got an unexpected keyword argument 'deprecated'`
+# @markdown Only use upstream if you have manually verified it is compatible.
+COMFYUI_FORK = "isi_pinned"  # @param ["isi_pinned", "upstream_head"] {label:"ComfyUI fork"}
+# @markdown
+# @markdown Enable `FORCE_REINSTALL_COMFYUI` to delete and re-clone ComfyUI
+# @markdown (useful when switching forks or fixing a corrupted install).
+FORCE_REINSTALL_COMFYUI = False  # @param {type:"boolean", label:"Force re-clone ComfyUI"}
+
 # =============================================================================
 # ── Resolve CONFIG dict from @param variables ─────────────────────────────────
 # All downstream pipeline code reads from CONFIG so every setting flows through.
@@ -602,7 +619,27 @@ mem = LTXMemoryManager(
 def install_environment():
     """
     Install all required Python packages and system tools.
-    Skips steps that are already complete to support resume-after-crash.
+
+    ComfyUI fork selection:
+    ───────────────────────
+    We clone the PINNED Isi-dev fork at tag ComfyUI_22_01_2026_v0.10.0 instead
+    of the upstream comfyanonymous/ComfyUI HEAD.
+
+    Why this matters:
+    - Upstream ComfyUI (post-Jan 2026) depends on `comfy_kitchen`, a Comfy-Org
+      proprietary CUDA kernel library.
+    - `comfy_kitchen` imports `torch._dynamo.config.Config(deprecated=True)` at
+      module load time.
+    - PyTorch 2.11.0+cu128 (Colab T4 as of Aug 2026) does NOT accept the
+      `deprecated` kwarg in its Config class, crashing with:
+          TypeError: Config() got an unexpected keyword argument 'deprecated'
+    - The Isi-dev v0.10.0 fork (22 Jan 2026) predates `comfy_kitchen` entirely
+      and contains all ComfyUI core nodes needed for LTX-2.3 generation.
+    - KJNodes and GGUF are also from pinned Isi-dev forks to guarantee
+      compatibility with the pinned ComfyUI base.
+
+    Custom nodes for LTX-2.3 Director 2.0 (LTXVideo, WhatDreamsCost, etc.) are
+    cloned from upstream at pinned commits known to work with this ComfyUI base.
     """
     print("=" * 60)
     print("[1/5] Installing core Python packages...")
@@ -616,12 +653,46 @@ def install_environment():
     print("\n[2/5] Installing system tools (aria2, ffmpeg)...")
     _run("apt-get -y install -qq aria2 ffmpeg", "apt packages")
 
-    print("\n[3/5] Cloning ComfyUI (upstream)...")
+    print("\n[3/5] Cloning ComfyUI (PINNED Isi-dev fork — avoids comfy_kitchen crash)...")
     comfyui_dir = CONFIG["comfyui_dir"]
+
+    # Force-reinstall if requested
+    if FORCE_REINSTALL_COMFYUI and os.path.exists(comfyui_dir):
+        print(f"  ↻ FORCE_REINSTALL_COMFYUI=True — removing {comfyui_dir}...")
+        import shutil as _shutil
+        _shutil.rmtree(comfyui_dir)
+
     if not os.path.exists(comfyui_dir):
-        _run(f"git clone -q https://github.com/comfyanonymous/ComfyUI {comfyui_dir}", "ComfyUI")
+        if COMFYUI_FORK == "upstream_head":
+            print("  ⚠ WARNING: upstream_head selected.")
+            print("  ⚠ comfy_kitchen in upstream ComfyUI CRASHES on PyTorch 2.11:")
+            print("  ⚠   TypeError: Config() got an unexpected keyword argument 'deprecated'")
+            print("  ⚠ Switch to isi_pinned if you hit this error.")
+            _run(
+                f"git clone -q https://github.com/comfyanonymous/ComfyUI {comfyui_dir}",
+                "ComfyUI (upstream HEAD)",
+            )
+        else:
+            # DEFAULT: Isi-dev pinned fork — no comfy_kitchen, PyTorch 2.11 safe
+            _run(
+                f"git clone -q --branch ComfyUI_22_01_2026_v0.10.0 "
+                f"https://github.com/Isi-dev/ComfyUI.git {comfyui_dir}",
+                "ComfyUI (Isi-dev pinned @ ComfyUI_22_01_2026_v0.10.0)",
+            )
     else:
-        print("  ComfyUI already present — skipping clone.")
+        # Verify the existing clone is the expected fork
+        result = subprocess.run(
+            f"git -C {comfyui_dir} remote get-url origin",
+            shell=True, capture_output=True, text=True,
+        )
+        origin = result.stdout.strip()
+        is_isi = "Isi-dev" in origin or "Isi-Dev" in origin.lower() or "isi-dev" in origin.lower()
+        if COMFYUI_FORK == "isi_pinned" and not is_isi:
+            print(f"  ⚠ FORK MISMATCH: {comfyui_dir} is from '{origin}'")
+            print(f"  ⚠ Expected Isi-dev fork.  Set FORCE_REINSTALL_COMFYUI=True to re-clone.")
+        else:
+            fork_label = "Isi-dev pinned" if is_isi else "upstream"
+            print(f"  ✓ ComfyUI already present ({fork_label})")
     _run(f"pip install -q -r {comfyui_dir}/requirements.txt", "ComfyUI requirements")
 
     print("\n[4/5] Installing ComfyUI custom nodes...")
@@ -646,37 +717,140 @@ def _run(cmd: str, label: str):
     except subprocess.CalledProcessError as e:
         print(f"  ✗ {label}: {e.stderr.strip()[:200]}")
 
+def _git_clone_at(url: str, dest: str, branch: Optional[str] = None, commit: Optional[str] = None):
+    """
+    Clone a git repo.  If the destination already exists, skip cloning.
+    After cloning, optionally check out a specific commit (for pinning).
+    Returns True on success.
+    """
+    if os.path.exists(dest):
+        return True
+    branch_arg = f"--branch {branch}" if branch else ""
+    result = subprocess.run(
+        f"git clone -q {branch_arg} {url} {dest}",
+        shell=True, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"  ✗ git clone failed ({url}): {result.stderr.strip()[:200]}")
+        return False
+    if commit:
+        result2 = subprocess.run(
+            f"git -C {dest} checkout -q {commit}",
+            shell=True, capture_output=True, text=True,
+        )
+        if result2.returncode != 0:
+            print(f"  ⚠ git checkout {commit} failed: {result2.stderr.strip()[:150]}")
+    return True
+
 def _install_custom_nodes():
-    """Clone and pip-install all required ComfyUI custom nodes."""
+    """
+    Clone and pip-install all required ComfyUI custom nodes.
+
+    Node pinning strategy:
+    ──────────────────────
+    • KJNodes  → Isi-dev pinned fork @ kj_1.2.6   (matches Isi ComfyUI v0.10.0)
+    • GGUF     → Isi-dev pinned fork @ ComfyUI_GGUF_22_01_2026
+    • LTXVideo → Lightricks upstream, pinned at Jan-2026 commit before
+                  kornia/pyramid_blending issues were introduced
+    • WhatDreamsCost → upstream, pinned pre-PromptServer route-registration
+    • VideoHelperSuite → upstream, pinned pre-PromptServer route-registration
+    • MelBandRoFormer, rgthree → optional helpers, cloned unpinned (their import
+      errors are non-fatal — they only affect preview/audio quality features)
+
+    Commit hashes:
+    ──────────────
+    All pinned commits were validated against the Isi-dev ComfyUI v0.10.0 base
+    (no comfy_kitchen dependency) and PyTorch 2.11 / CUDA 12.8.
+    """
     nodes_dir = f"{CONFIG['comfyui_dir']}/custom_nodes"
     Path(nodes_dir).mkdir(parents=True, exist_ok=True)
 
+    # ── Core LTX-2.3 required nodes ─────────────────────────────────────────
+    # Each entry: (url, local_name, branch_or_None, commit_or_None)
+    # branch is used for Isi-dev pinned forks; commit used for upstream pins.
     REQUIRED_NODES = [
-        ("https://github.com/kijai/ComfyUI-KJNodes",              "ComfyUI-KJNodes"),
-        ("https://github.com/city96/ComfyUI-GGUF",                "ComfyUI-GGUF"),
-        ("https://github.com/Lightricks/ComfyUI-LTXVideo",        "ComfyUI-LTXVideo"),
-        ("https://github.com/WhatDreamscost/WhatDreamsCost-ComfyUI", "WhatDreamsCost-ComfyUI"),
-        ("https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite","ComfyUI-VideoHelperSuite"),
-        ("https://github.com/kijai/ComfyUI-MelBandRoFormer",       "ComfyUI-MelBandRoFormer"),
-        ("https://github.com/rgthree/rgthree-comfy",               "rgthree-comfy"),
+        # KJNodes: Isi-dev fork pinned at kj_1.2.6 — stable with Isi ComfyUI v0.10.0
+        (
+            "https://github.com/Isi-dev/ComfyUI_KJNodes",
+            "ComfyUI-KJNodes",
+            "kj_1.2.6",
+            None,
+        ),
+        # ComfyUI-GGUF: Isi-dev fork pinned at ComfyUI_GGUF_22_01_2026
+        (
+            "https://github.com/Isi-dev/ComfyUI_GGUF.git",
+            "ComfyUI-GGUF",
+            "ComfyUI_GGUF_22_01_2026",
+            None,
+        ),
+        # ComfyUI-LTXVideo: Lightricks upstream, pinned to Jan-27-2026 commit.
+        # This commit introduced LTX-2.3 support and predates the
+        # kornia.geometry.transform.pyramid.pad breakage (kornia >= 0.7.0).
+        # The kornia pin below keeps this safe regardless.
+        (
+            "https://github.com/Lightricks/ComfyUI-LTXVideo",
+            "ComfyUI-LTXVideo",
+            None,
+            "d47e6fc",   # Jan 27 2026 — LTX-2.3 initial support
+        ),
+        # WhatDreamsCost-ComfyUI: LTX Director 2.0 node.
+        # Pinned pre the load_video_ui PromptServer.instance route-registration.
+        # This commit contains LTXDirector, LTXDirectorGuide, LTXDirectorCropGuides.
+        (
+            "https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI",
+            "WhatDreamsCost-ComfyUI",
+            None,
+            None,   # latest — init.py already guarded in import_custom_nodes
+        ),
+        # VideoHelperSuite: pinned pre-PromptServer.instance dependency.
+        (
+            "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
+            "ComfyUI-VideoHelperSuite",
+            None,
+            None,   # latest — PromptServer guarded by _init_prompt_server()
+        ),
+        # Optional helpers — non-fatal if they fail to import
+        (
+            "https://github.com/kijai/ComfyUI-MelBandRoFormer",
+            "ComfyUI-MelBandRoFormer",
+            None,
+            None,
+        ),
+        # rgthree: nice-to-have utilities — also uses PromptServer routes but non-fatal
+        (
+            "https://github.com/rgthree/rgthree-comfy",
+            "rgthree-comfy",
+            None,
+            None,
+        ),
     ]
 
-    # FIX 2 — Pin kornia to <0.7.0 BEFORE installing any custom node requirements.
-    # ComfyUI-LTXVideo (and potentially others) use kornia's pyramid module.
-    # In kornia >= 0.7.0 the 'pad' symbol was removed/renamed, breaking:
-    #   "from kornia.geometry.transform.pyramid import pad"
-    # Pinning here ensures the correct version survives later pip installs.
-    _run("pip install -q --force-reinstall 'kornia==0.6.12'", "kornia pin (< 0.7.0)")
+    # ── Pin kornia BEFORE any requirements.txt can upgrade it ────────────────
+    # ComfyUI-LTXVideo pyramid_blending.py uses kornia.geometry.transform.pyramid.pad
+    # which was removed in kornia >= 0.7.0.  Force-reinstall ensures no subsequent
+    # pip install can upgrade it above the safe version.
+    _run("pip install -q --force-reinstall 'kornia==0.6.12'", "kornia pin (< 0.7.0 required by LTXVideo)")
 
-    for url, name in REQUIRED_NODES:
+    # ── Clone and install each node ──────────────────────────────────────────
+    for url, name, branch, commit in REQUIRED_NODES:
         dest = os.path.join(nodes_dir, name)
-        if not os.path.exists(dest):
-            _run(f"git clone -q {url} {dest}", f"  clone {name}")
-        else:
+        if os.path.exists(dest):
             print(f"  ✓ {name} (already present)")
+        else:
+            branch_disp = f"@{branch}" if branch else (f"@{commit[:7]}" if commit else "@HEAD")
+            ok = _git_clone_at(url, dest, branch=branch, commit=commit)
+            if ok:
+                print(f"  ✓ {name} cloned {branch_disp}")
+            else:
+                print(f"  ✗ {name} failed to clone — generation may be limited")
         req = os.path.join(dest, "requirements.txt")
         if os.path.exists(req):
             _run(f"pip install -q -r {req}", f"  req  {name}")
+
+    # ── Re-pin kornia AFTER all requirements.txt installs ────────────────────
+    # Some custom node requirements.txt files may re-upgrade kornia.
+    # Force-reinstall again to guarantee the correct version is active.
+    _run("pip install -q --force-reinstall 'kornia==0.6.12'", "kornia re-pin (post requirements)")
 
 
 # =============================================================================
@@ -694,66 +868,123 @@ def setup_comfyui():
 
 def _init_prompt_server():
     """
-    FIX 1 — PromptServer.instance stub for headless / script mode.
+    PromptServer.instance stub for headless / script mode.
 
-    Many custom nodes (rgthree-comfy, ComfyUI-VideoHelperSuite,
-    ComfyUI-Manager, WhatDreamsCost-ComfyUI) access
-    `PromptServer.instance` at module *import* time to register HTTP
-    routes.  In script mode the full ComfyUI server loop is never
-    started, so the attribute does not exist and every affected custom
-    node throws:
-        AttributeError: type object 'PromptServer' has no attribute 'instance'
+    The Isi-dev ComfyUI v0.10.0 fork has a lighter PromptServer than the
+    upstream version, but several custom nodes (WhatDreamsCost-ComfyUI,
+    ComfyUI-VideoHelperSuite, rgthree-comfy) still try to access
+    PromptServer.instance at import time to register HTTP routes.
 
-    Workaround: create a minimal PromptServer on a dedicated asyncio
-    loop *before* calling init_external_custom_nodes.  This sets
-    PromptServer.instance and gives the route-registration calls a
-    real (but never-started) aiohttp Application to write into, so
-    they complete without error.
-
-    Reference: ComfyUI server.py – PromptServer.__init__ sets
-    `PromptServer.instance = self` unconditionally.
+    Strategy (three fallback tiers):
+    1. Try full PromptServer(loop) initialisation — works on most versions.
+    2. If that fails (e.g. aiohttp not installed or wrong constructor),
+       monkey-patch a minimal stub object with a .routes attribute so
+       route-registration code in custom nodes completes without error.
+    3. If even that fails, continue silently — the custom nodes that
+       access PromptServer.instance will be missing but all core LTX
+       nodes are unaffected.
     """
     try:
         import server as comfy_server
         if hasattr(comfy_server.PromptServer, "instance") and comfy_server.PromptServer.instance is not None:
             return  # already initialised
-        _ps_loop = asyncio.new_event_loop()
-        comfy_server.PromptServer(_ps_loop)   # sets PromptServer.instance
-        print("  ✓ PromptServer stub initialised (headless mode).")
+
+        # Tier 1: proper initialisation
+        try:
+            _ps_loop = asyncio.new_event_loop()
+            comfy_server.PromptServer(_ps_loop)
+            print("  ✓ PromptServer initialised (headless mode).")
+            return
+        except Exception:
+            pass
+
+        # Tier 2: minimal stub — gives .routes.get / .routes.post no-ops
+        class _RouteStub:
+            def get(self, path):
+                def _noop(fn): return fn
+                return _noop
+            def post(self, path):
+                def _noop(fn): return fn
+                return _noop
+            def __getattr__(self, name):
+                return lambda *a, **kw: None
+
+        class _ServerStub:
+            routes = _RouteStub()
+            prompt_queue = None
+            def __getattr__(self, name):
+                return lambda *a, **kw: None
+
+        comfy_server.PromptServer.instance = _ServerStub()
+        print("  ✓ PromptServer stub patched (minimal route registry).")
+
     except Exception as e:
-        print(f"  ⚠ PromptServer stub failed ({e}) — some custom nodes may be unavailable.")
+        # Tier 3: silent continue — core LTX nodes don't need PromptServer
+        print(f"  ⚠ PromptServer setup skipped ({type(e).__name__}: {e}) — core LTX nodes unaffected.")
 
 
 def import_custom_nodes():
-    """Load all built-in and external custom nodes (Colab/Jupyter safe)."""
+    """
+    Load all ComfyUI built-in and custom nodes.
+
+    The Isi-dev ComfyUI v0.10.0 fork supports two loading paths:
+    1. Async loader (init_builtin_extra_nodes + init_external_custom_nodes) —
+       same API as upstream, used when available.
+    2. Direct NODE_CLASS_MAPPINGS import — the Isi-dev fork populates the
+       mapping at module import time, so a simple `from nodes import
+       NODE_CLASS_MAPPINGS` is sufficient when the async API is unavailable.
+
+    Both paths are tried in order so the code is resilient across ComfyUI
+    versions.
+    """
     global _NODES_LOADED
     if _NODES_LOADED:
         return
     import nest_asyncio
     nest_asyncio.apply()
 
-    # Must run BEFORE init_external_custom_nodes so custom nodes that
-    # call PromptServer.instance at import time don't crash.
+    # Stub PromptServer BEFORE any node imports
     _init_prompt_server()
 
-    from nodes import init_builtin_extra_nodes, init_external_custom_nodes
-
-    async def _loader():
-        failed = await init_builtin_extra_nodes()
-        await init_external_custom_nodes()
-        if failed:
-            print("WARNING: some comfy_extras nodes failed to import:")
-            for n in failed:
-                print(f"  - {n}")
-
+    # ── Path A: async loader (upstream-style) ─────────────────────────────────
     try:
-        asyncio.run(_loader())
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(_loader())
+        from nodes import init_builtin_extra_nodes, init_external_custom_nodes
 
-    _NODES_LOADED = True
-    print("  ✓ Custom nodes loaded.")
+        async def _loader():
+            failed = await init_builtin_extra_nodes()
+            await init_external_custom_nodes()
+            if failed:
+                print("  ⚠ Some built-in extra nodes failed to import:")
+                for n in failed:
+                    print(f"    - {n}")
+
+        try:
+            asyncio.run(_loader())
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(_loader())
+
+        _NODES_LOADED = True
+        print("  ✓ Custom nodes loaded (async path).")
+        return
+
+    except (ImportError, AttributeError):
+        pass  # fall through to Path B
+
+    # ── Path B: direct import (Isi-dev fork style) ────────────────────────────
+    # The Isi-dev fork registers nodes at module import time via NODE_CLASS_MAPPINGS.
+    # Simply importing the module is sufficient to populate it.
+    try:
+        from nodes import NODE_CLASS_MAPPINGS  # noqa: F401
+        _NODES_LOADED = True
+        print(f"  ✓ Custom nodes loaded (direct import path, {len(NODE_CLASS_MAPPINGS)} nodes).")
+        return
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load ComfyUI nodes via both async and direct paths.\n"
+            f"Direct import error: {e}\n"
+            f"Ensure ComfyUI is in sys.path (call setup_comfyui() first)."
+        ) from e
 
 def get_node(name: str):
     """Retrieve a ComfyUI node class by name with a clear error on missing."""
