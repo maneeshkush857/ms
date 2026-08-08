@@ -689,7 +689,7 @@ def preflight_checks(config: LTX23Config) -> bool:
 
     # 2. GPU memory check
     if torch and torch.cuda.is_available():
-        total_vram = torch.cuda.get_device_properties(0).total_mem / (1024 ** 3)
+        total_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
         if total_vram < 14.0:
             logger.warning(
                 f"[Preflight] GPU VRAM ({total_vram:.1f}GB) is below recommended 14GB. "
@@ -982,36 +982,45 @@ def download_models(config: LTX23Config) -> None:
 
 
 def download_assets(config: LTX23Config) -> None:
-    """Download reference images and audio for the timeline."""
+    """Check that user-supplied reference images and audio exist.
+
+    These assets are user-specific and cannot be auto-downloaded from a
+    public URL.  Users must upload them manually to the input directory.
+    This check is non-fatal -- missing files produce a warning but do not
+    crash the pipeline.
+    """
     logger.info("=" * 60)
-    logger.info("ASSET DOWNLOADS")
+    logger.info("ASSET CHECK")
     logger.info("=" * 60)
 
     input_dir = Path(config.comfyui_dir) / "input" / "whatdreamscost"
     input_dir.mkdir(parents=True, exist_ok=True)
 
-    # Reference images
+    # Expected reference images and audio
     image_files = ["1.png", "2.png", "3.png", "4.png", "5.3.png"]
-    base_url = "https://huggingface.co/whatdreamscost/LTX-Director-Assets/resolve/main"
-
-    for img_file in image_files:
-        dest = input_dir / img_file
-        if dest.exists():
-            logger.info(f"[Assets] Already exists: {img_file}")
-            continue
-        url = f"{base_url}/{img_file}"
-        _download_with_aria2c(url, str(input_dir), img_file)
-
-    # Audio file
     audio_file = "Late night trap.mp3"
-    audio_dest = input_dir / audio_file
-    if not audio_dest.exists():
-        audio_url = f"{base_url}/Late%20night%20trap.mp3"
-        _download_with_aria2c(audio_url, str(input_dir), audio_file)
-    else:
-        logger.info(f"[Assets] Already exists: {audio_file}")
+    all_assets = image_files + [audio_file]
 
-    logger.info("[Assets] All assets ready!")
+    missing = []
+    for asset in all_assets:
+        dest = input_dir / asset
+        if dest.exists():
+            logger.info(f"[Assets] Found: {asset}")
+        else:
+            missing.append(asset)
+
+    if missing:
+        logger.warning(
+            "[Assets] The following user-supplied files are MISSING:\n"
+            + "\n".join(f"  - {f}" for f in missing)
+        )
+        logger.warning(
+            f"[Assets] Please upload them to: {input_dir}\n"
+            "[Assets] The pipeline can still run, but timeline segments that "
+            "reference these files may fail."
+        )
+    else:
+        logger.info("[Assets] All assets found!")
 
 
 def _download_with_aria2c(url: str, dest_dir: str, filename: str) -> bool:
