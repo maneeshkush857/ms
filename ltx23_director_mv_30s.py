@@ -486,7 +486,7 @@ def get_t4_optimal_settings():
         "height": 480,
         "frames": 97,
         "skip_pass2": True,
-        "pass1_steps": 6,
+        "pass1_steps": 8,
     }
     print("T4 Optimal Settings:")
     for key, value in settings.items():
@@ -679,6 +679,15 @@ def mainLTXDirector(
 ):
     import_custom_nodes()
     clear_output()
+
+    # Warn if frames exceeds batch_frames on T4 GPU (risk of OOM)
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0).lower()
+        if "t4" in gpu_name and frames > batch_frames:
+            print(f"WARNING: frames ({frames}) exceeds batch_frames ({batch_frames}) on T4 GPU.")
+            print("This may cause OOM during sampling. Consider reducing frames or increasing batch_frames.")
+            print(f"Recommended: frames <= batch_frames (currently {batch_frames}) for T4 stability.")
+
     with torch.inference_mode():
 
         # --- Step 1: Load UNet (GGUF) ---
@@ -878,7 +887,7 @@ def mainLTXDirector(
             apply_guide=True,
             use_motion_guide=False,
             max_frames=batch_frames,
-            overlap=min(batch_frames // 4, 16),
+            overlap=max(batch_frames // 4, 16),
             ensure_start_guide=False,
             positive=get_value_at_index(ltxvconditioning_10, 0),
             negative=get_value_at_index(ltxvconditioning_10, 1),
@@ -995,7 +1004,7 @@ def mainLTXDirector(
                 apply_guide=True,
                 use_motion_guide=False,
                 max_frames=batch_frames,
-                overlap=min(batch_frames // 4, 16),
+                overlap=max(batch_frames // 4, 16),
                 ensure_start_guide=False,
                 positive=get_value_at_index(ltxdirectorcropguides_55, 0),
                 negative=get_value_at_index(ltxdirectorcropguides_55, 1),
