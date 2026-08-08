@@ -39,8 +39,7 @@ import subprocess
 
 !git clone --branch kj_1.2.6 https://github.com/Isi-dev/ComfyUI_KJNodes
 !git clone --branch ComfyUI_GGUF_22_01_2026 https://github.com/Isi-dev/ComfyUI_GGUF.git
-# NOTE: rgthree-comfy no longer needed -- LoRA loading uses built-in LoraLoader node
-# NOTE: whatdreamscost-comfyui no longer needed -- replaced with standard ComfyUI nodes
+!git clone https://github.com/WhatDreamscost/WhatDreamsCost-ComfyUI.git
 !git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
 
 # %cd /content/ComfyUI/custom_nodes/ComfyUI_KJNodes
@@ -48,6 +47,8 @@ import subprocess
 # %cd /content/ComfyUI/custom_nodes/ComfyUI_GGUF
 !pip install -r requirements.txt
 # %cd /content/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite
+!pip install -r requirements.txt
+# %cd /content/ComfyUI/custom_nodes/WhatDreamsCost-ComfyUI
 !pip install -r requirements.txt
 
 def install_apt_packages():
@@ -344,18 +345,14 @@ def upload_image():
     return None
 
 
-def upload_multiple_images(count=1):
-    """Upload reference image(s) for video conditioning.
-    
-    Note: The pipeline uses only the first uploaded image as the
-    conditioning frame. Additional images are ignored.
-    """
+def upload_multiple_images(count=5):
+    """Upload multiple images for timeline segments."""
     from google.colab import files
     import os
 
     os.makedirs('/content/ComfyUI/input/whatdreamscost', exist_ok=True)
 
-    print(f"Upload up to {count} reference image(s) for conditioning:")
+    print(f"Upload up to {count} reference image(s) for timeline segments:")
     uploaded = files.upload()
 
     paths = []
@@ -387,6 +384,80 @@ def upload_audio():
         return dest_path
 
     return None
+
+
+def build_timeline_data(image_paths, audio_path, audio_trim_start, global_prompt, frames):
+    """Construct the timeline_data JSON blob that the LTXDirector node expects.
+
+    The LTXDirector node in ComfyUI receives its entire timeline configuration
+    (image segments, audio segments, global prompt, retake config) through a single
+    serialized JSON string parameter called 'timeline_data'. This function builds
+    that blob programmatically from user-provided inputs, matching the exact schema
+    observed in the workflow JSON (widgets_values[6] of node 131).
+    """
+    import time
+
+    segments = []
+    num_images = len(image_paths) if image_paths else 0
+
+    if num_images > 0:
+        segment_length = frames / num_images
+        for i, img_path in enumerate(image_paths):
+            img_filename = os.path.basename(img_path)
+            image_file = f"whatdreamscost/{img_filename}"
+            seg_id = f"{int(time.time() * 1000)}{i}seg"
+            segments.append({
+                "id": seg_id,
+                "start": i * segment_length,
+                "length": segment_length,
+                "prompt": "",
+                "type": "image",
+                "imageFile": image_file,
+                "imageB64": f"/api/view?filename={img_filename}&type=input&subfolder=whatdreamscost",
+                "isEndFrame": False,
+            })
+
+    audio_segments = []
+    if audio_path:
+        audio_filename = os.path.basename(audio_path)
+        audio_file = f"whatdreamscost/{audio_filename}"
+        audio_segments.append({
+            "id": f"{int(time.time() * 1000)}aud",
+            "type": "audio",
+            "start": 0,
+            "length": frames + 0.5,
+            "trimStart": float(audio_trim_start),
+            "audioDurationFrames": 2880,
+            "audioFile": audio_file,
+            "fileName": audio_filename,
+            "waveformPeaks": [],
+        })
+
+    timeline = {
+        "mainTrackEnabled": True,
+        "audioTrackEnabled": bool(audio_path),
+        "motionTrackEnabled": True,
+        "propHeight": 90,
+        "globalPropHeight": 470,
+        "showFilenames": True,
+        "overrideAudio": False,
+        "inpaint_audio": True,
+        "global_prompt": global_prompt,
+        "retake_global_prompt": "",
+        "retakeMode": False,
+        "retakeStart": 24,
+        "retakeLength": 48,
+        "retakePrompt": "",
+        "retakeStrength": 1,
+        "retakeVideo": None,
+        "normalStartFrame": 0,
+        "normalDurationFrames": frames,
+        "segments": segments,
+        "motionSegments": [],
+        "audioSegments": audio_segments,
+    }
+
+    return json.dumps(timeline)
 
 
 def clear_memory():
@@ -527,14 +598,13 @@ print("All model downloads complete!")
 # @markdown Upload reference images for timeline segments and audio track.
 
 # @markdown ### Image Segments
-# @markdown Upload a reference image for video conditioning.
-# @markdown (Only the first image is used as the conditioning frame.)
+# @markdown Upload up to 5 reference images for timeline segments.
 upload_images_now = True  # @param {type:"boolean"}
 image_files = []
 if upload_images_now:
-    image_files = upload_multiple_images(count=1)
+    image_files = upload_multiple_images(count=5)
     clear_output()
-    print(f"Uploaded {len(image_files)} image(s) for conditioning.")
+    print(f"Uploaded {len(image_files)} image(s) for timeline segments.")
 
 # @markdown ### Audio Track
 upload_audio_now = True  # @param {type:"boolean"}
@@ -681,104 +751,81 @@ def mainLTXDirector(
 
         clear_output()
 
-        # --- Step 8: Standard nodes replacing LTXDirector ---
-        # The original LTXDirector node from whatdreamscost-comfyui is unavailable.
-        # We replace it with standard ComfyUI built-in nodes that achieve the same
-        # functionality: encode prompt, load/preprocess image, create video latent,
-        # condition with image, and create audio latent.
-        print("Encoding prompt and preparing latents...")
+        # --- Step 8: LTXDirector ---
+        # The LTXDirector node receives its timeline configuration (images, audio,
+        # segments, prompt, retake config) through a single serialized JSON blob
+        # parameter called 'timeline_data' (widgets_values[6] in the workflow JSON).
+        print("Running LTXDirector...")
+        ltxdirector = NODE_CLASS_MAPPINGS["LTXDirector"]()
 
-        # 8a: Encode the global prompt with CLIPTextEncode
-        cliptextencode = NODE_CLASS_MAPPINGS["CLIPTextEncode"]()
-        cliptextencode_positive = cliptextencode.encode(
-            text=global_prompt,
+        # Build the timeline_data JSON blob from user inputs
+        timeline_data_json = build_timeline_data(
+            image_paths=image_paths if image_paths else [],
+            audio_path=audio_path,
+            audio_trim_start=audio_trim_start,
+            global_prompt=global_prompt,
+            frames=frames,
+        )
+
+        # Compute segment_lengths string (comma-separated frame lengths per segment)
+        num_images = len(image_paths) if image_paths else 0
+        if num_images > 0:
+            seg_len = frames / num_images
+            segment_lengths_str = ",".join([str(seg_len)] * num_images)
+        else:
+            segment_lengths_str = ""
+
+        # Guide strengths: one "1.00" per segment
+        guide_strength_str = ",".join(["1.00"] * max(num_images, 1))
+
+        # Local prompts: empty per-segment prompts separated by " | "
+        local_prompts_str = " | ".join([""] * max(num_images, 1))
+
+        ltxdirector_131 = ltxdirector.EXECUTE_NORMALIZED(
+            # Linked inputs (from other nodes)
+            model=get_value_at_index(powerloraloaderrgthree_138, 0),
             clip=get_value_at_index(powerloraloaderrgthree_138, 1),
-        )
-
-        # 8b: Load and preprocess first image (if available) for image conditioning
-        if image_paths and len(image_paths) > 0:
-            loadimage = NODE_CLASS_MAPPINGS["LoadImage"]()
-            # image_paths contain full paths like /content/ComfyUI/input/whatdreamscost/file.png
-            # LoadImage expects a path relative to ComfyUI's input directory
-            image_rel_path = "whatdreamscost/" + os.path.basename(image_paths[0])
-            loadimage_result = loadimage.load_image(
-                image=image_rel_path
-            )
-
-            ltxvpreprocess = NODE_CLASS_MAPPINGS["LTXVPreprocess"]()
-            ltxvpreprocess_result = ltxvpreprocess.EXECUTE_NORMALIZED(
-                img_compression=18,
-                image=get_value_at_index(loadimage_result, 0),
-            )
-            has_image = True
-        else:
-            has_image = False
-
-        # 8c: Create empty video latent at half resolution for pass 1
-        # The two-pass strategy samples at half-res first (coarse pass), then
-        # LTXVLatentUpsampler handles the 2x upscale, and pass 2 refines at full-res.
-        # Snap to nearest multiple of 32 as required by the latent dimensions.
-        pass1_width = (width // 2 + 31) // 32 * 32
-        pass1_height = (height // 2 + 31) // 32 * 32
-        emptyltxvlatentvideo = NODE_CLASS_MAPPINGS["EmptyLTXVLatentVideo"]()
-        emptyltxvlatentvideo_result = emptyltxvlatentvideo.EXECUTE_NORMALIZED(
-            width=pass1_width,
-            height=pass1_height,
-            length=frames,
-            batch_size=1,
-        )
-
-        # 8d: Condition video latent with image (if available)
-        if has_image:
-            ltxvimgtovideoinplace = NODE_CLASS_MAPPINGS["LTXVImgToVideoInplace"]()
-            ltxvimgtovideoinplace_result = ltxvimgtovideoinplace.EXECUTE_NORMALIZED(
-                strength=1.0,
-                bypass=False,
-                vae=get_value_at_index(vaeloader_36, 0),
-                image=get_value_at_index(ltxvpreprocess_result, 0),
-                latent=get_value_at_index(emptyltxvlatentvideo_result, 0),
-            )
-            video_latent = ltxvimgtovideoinplace_result
-        else:
-            video_latent = emptyltxvlatentvideo_result
-
-        # 8e: Create empty audio latent
-        ltxvemptylatentaudio = NODE_CLASS_MAPPINGS["LTXVEmptyLatentAudio"]()
-        ltxvemptylatentaudio_result = ltxvemptylatentaudio.EXECUTE_NORMALIZED(
-            frames_number=frames,
-            frame_rate=fps,
-            batch_size=1,
             audio_vae=get_value_at_index(vaeloader_8, 0),
+            # STRING input slot
+            global_prompt=global_prompt,
+            # Widget parameters
+            timeline_data=timeline_data_json,
+            local_prompts=local_prompts_str,
+            segment_lengths=segment_lengths_str,
+            epsilon=0.001,
+            guide_strength=guide_strength_str,
+            mainTrackEnabled=True,
+            audioTrackEnabled=bool(audio_path),
+            motionTrackEnabled=True,
+            frame_rate=fps,
+            custom_width=width,
+            custom_height=height,
+            resize_method="maintain aspect ratio",
+            divisible_by=32,
+            img_compression=18,
         )
 
-        # Store references for downstream steps (replacing ltxdirector_131 outputs):
-        # model: get_value_at_index(powerloraloaderrgthree_138, 0)
-        # positive: get_value_at_index(cliptextencode_positive, 0)
-        # video_latent: get_value_at_index(video_latent, 0)
-        # audio_latent: get_value_at_index(ltxvemptylatentaudio_result, 0)
-        # frame_rate: fps (used directly)
-        pipeline_model = get_value_at_index(powerloraloaderrgthree_138, 0)
-        pipeline_positive = get_value_at_index(cliptextencode_positive, 0)
-        pipeline_video_latent = get_value_at_index(video_latent, 0)
-        pipeline_audio_latent = get_value_at_index(ltxvemptylatentaudio_result, 0)
-
-        # Delete clip after encoding the prompt
+        # Delete clip after LTXDirector has encoded the prompt
         del dualcliploader_12
         del powerloraloaderrgthree_138
         torch.cuda.empty_cache()
         gc.collect()
 
+        # Outputs from LTXDirector:
+        # 0: model, 1: positive, 2: video_latent, 3: audio_latent,
+        # 4: guide_data, 5: motion_guide_data, 6: frame_rate, 7: combined_audio
+
         # --- Step 9: ConditioningZeroOut (negative conditioning) ---
         conditioningzeroout = NODE_CLASS_MAPPINGS["ConditioningZeroOut"]()
         conditioningzeroout_9 = conditioningzeroout.zero_out(
-            conditioning=pipeline_positive
+            conditioning=get_value_at_index(ltxdirector_131, 1)
         )
 
         # --- Step 10: LTXVConditioning ---
         ltxvconditioning = NODE_CLASS_MAPPINGS["LTXVConditioning"]()
         ltxvconditioning_10 = ltxvconditioning.EXECUTE_NORMALIZED(
-            frame_rate=fps,
-            positive=pipeline_positive,
+            frame_rate=get_value_at_index(ltxdirector_131, 6),
+            positive=get_value_at_index(ltxdirector_131, 1),
             negative=get_value_at_index(conditioningzeroout_9, 0),
         )
 
@@ -787,21 +834,35 @@ def mainLTXDirector(
         # ======================================
         print("Pass 1: Base sampling...")
 
-        # --- Step 11: Pass-through (replaces LTXDirectorGuide #133) ---
-        # The original LTXDirectorGuide applied per-segment guidance and downscaling.
-        # Without the Director timeline, we pass conditioning and latent through directly.
-        # The half-resolution latent created in Step 8c provides the coarse-to-fine
-        # strategy that the original downscale_factor=0.5 achieved.
-        pass1_positive = get_value_at_index(ltxvconditioning_10, 0)
-        pass1_negative = get_value_at_index(ltxvconditioning_10, 1)
-        pass1_latent = pipeline_video_latent
-        pass1_model = pipeline_model
+        # --- Step 11: LTXDirectorGuide #133 (pass 1, downscale=0.5) ---
+        ltxdirectorguide = NODE_CLASS_MAPPINGS["LTXDirectorGuide"]()
+        ltxdirectorguide_133 = ltxdirectorguide.EXECUTE_NORMALIZED(
+            mode="None",
+            strength=1,
+            downscale_factor=0.5,
+            resize_method="bicubic",
+            guide_strength=1,
+            guide_mode="center",
+            apply_guide=True,
+            use_motion_guide=False,
+            max_frames=256,
+            overlap=64,
+            ensure_start_guide=False,
+            positive=get_value_at_index(ltxvconditioning_10, 0),
+            negative=get_value_at_index(ltxvconditioning_10, 1),
+            vae=get_value_at_index(vaeloader_36, 0),
+            latent=get_value_at_index(ltxdirector_131, 2),
+            guide_data=get_value_at_index(ltxdirector_131, 4),
+            motion_guide_data=get_value_at_index(ltxdirector_131, 5),
+            model=get_value_at_index(ltxdirector_131, 0),
+        )
+        # Outputs: 0: positive, 1: negative, 2: latent, 3: model, 4: latent_downscale_factor
 
         # --- Step 12: LTXVConcatAVLatent #29 ---
         ltxvconcatavlatent = NODE_CLASS_MAPPINGS["LTXVConcatAVLatent"]()
         ltxvconcatavlatent_29 = ltxvconcatavlatent.EXECUTE_NORMALIZED(
-            video_latent=pass1_latent,
-            audio_latent=pipeline_audio_latent,
+            video_latent=get_value_at_index(ltxdirectorguide_133, 2),
+            audio_latent=get_value_at_index(ltxdirector_131, 3),
         )
 
         # --- Step 13: BasicScheduler #33 (pass 1) ---
@@ -810,7 +871,7 @@ def mainLTXDirector(
             scheduler=scheduler_name,
             steps=pass1_steps,
             denoise=pass1_denoise,
-            model=pass1_model,
+            model=get_value_at_index(ltxdirectorguide_133, 3),
         )
 
         # --- Step 14: KSamplerSelect #32 (pass 1) ---
@@ -825,9 +886,9 @@ def mainLTXDirector(
         cfgguider = NODE_CLASS_MAPPINGS["CFGGuider"]()
         cfgguider_28 = cfgguider.EXECUTE_NORMALIZED(
             cfg=1,
-            model=pass1_model,
-            positive=pass1_positive,
-            negative=pass1_negative,
+            model=get_value_at_index(ltxdirectorguide_133, 3),
+            positive=get_value_at_index(ltxdirectorguide_133, 0),
+            negative=get_value_at_index(ltxdirectorguide_133, 1),
         )
 
         # --- Step 17: SamplerCustomAdvanced #31 (pass 1) ---
@@ -857,11 +918,11 @@ def mainLTXDirector(
         # ======================================
         print("Cropping and upscaling...")
 
-        # --- Step 19: LTXVCropGuides #55 (replaces LTXDirectorCropGuides) ---
-        ltxvcropguides = NODE_CLASS_MAPPINGS["LTXVCropGuides"]()
-        ltxvcropguides_55 = ltxvcropguides.EXECUTE_NORMALIZED(
-            positive=pass1_positive,
-            negative=pass1_negative,
+        # --- Step 19: LTXDirectorCropGuides #55 ---
+        ltxdirectorcropguides = NODE_CLASS_MAPPINGS["LTXDirectorCropGuides"]()
+        ltxdirectorcropguides_55 = ltxdirectorcropguides.EXECUTE_NORMALIZED(
+            positive=get_value_at_index(ltxdirectorguide_133, 0),
+            negative=get_value_at_index(ltxdirectorguide_133, 1),
             latent=get_value_at_index(ltxvseparateavlatent_34, 0),
         )
 
@@ -873,7 +934,7 @@ def mainLTXDirector(
 
         ltxvlatentupsampler = NODE_CLASS_MAPPINGS["LTXVLatentUpsampler"]()
         ltxvlatentupsampler_14 = ltxvlatentupsampler.upsample_latent(
-            samples=get_value_at_index(ltxvcropguides_55, 2),
+            samples=get_value_at_index(ltxdirectorcropguides_55, 2),
             upscale_model=get_value_at_index(latentupscalemodelloader_13, 0),
             vae=get_value_at_index(vaeloader_36, 0),
         )
@@ -887,16 +948,32 @@ def mainLTXDirector(
         # ======================================
         print("Pass 2: Refine sampling...")
 
-        # --- Step 21: Pass-through (replaces LTXDirectorGuide #132, pass 2, downscale=1) ---
-        # Without the Director timeline, we pass conditioning and latent through directly.
-        pass2_positive = get_value_at_index(ltxvcropguides_55, 0)
-        pass2_negative = get_value_at_index(ltxvcropguides_55, 1)
-        pass2_latent = get_value_at_index(ltxvlatentupsampler_14, 0)
-        pass2_model = pipeline_model
+        # --- Step 21: LTXDirectorGuide #132 (pass 2, downscale=1) ---
+        ltxdirectorguide_132 = ltxdirectorguide.EXECUTE_NORMALIZED(
+            mode="None",
+            strength=1,
+            downscale_factor=1,
+            resize_method="bicubic",
+            guide_strength=1,
+            guide_mode="center",
+            apply_guide=True,
+            use_motion_guide=False,
+            max_frames=256,
+            overlap=64,
+            ensure_start_guide=False,
+            positive=get_value_at_index(ltxdirectorcropguides_55, 0),
+            negative=get_value_at_index(ltxdirectorcropguides_55, 1),
+            vae=get_value_at_index(vaeloader_36, 0),
+            latent=get_value_at_index(ltxvlatentupsampler_14, 0),
+            guide_data=get_value_at_index(ltxdirector_131, 4),
+            motion_guide_data=get_value_at_index(ltxdirector_131, 5),
+            model=get_value_at_index(ltxdirector_131, 0),
+        )
+        # Outputs: 0: positive, 1: negative, 2: latent, 3: model, 4: latent_downscale_factor
 
         # --- Step 22: LTXVConcatAVLatent #18 ---
         ltxvconcatavlatent_18 = ltxvconcatavlatent.EXECUTE_NORMALIZED(
-            video_latent=pass2_latent,
+            video_latent=get_value_at_index(ltxdirectorguide_132, 2),
             audio_latent=get_value_at_index(ltxvseparateavlatent_34, 1),
         )
 
@@ -905,7 +982,7 @@ def mainLTXDirector(
             scheduler=scheduler_name,
             steps=pass2_steps,
             denoise=pass2_denoise,
-            model=pass2_model,
+            model=get_value_at_index(ltxdirectorguide_132, 3),
         )
 
         # --- Step 24: KSamplerSelect #20 (pass 2) ---
@@ -914,9 +991,9 @@ def mainLTXDirector(
         # --- Step 25: CFGGuider #17 (pass 2, cfg=1) ---
         cfgguider_17 = cfgguider.EXECUTE_NORMALIZED(
             cfg=1,
-            model=pass2_model,
-            positive=pass2_positive,
-            negative=pass2_negative,
+            model=get_value_at_index(ltxdirectorguide_132, 3),
+            positive=get_value_at_index(ltxdirectorguide_132, 0),
+            negative=get_value_at_index(ltxdirectorguide_132, 1),
         )
 
         # --- Step 26: SamplerCustomAdvanced #19 (pass 2, SAME RandomNoise reused) ---
@@ -938,10 +1015,10 @@ def mainLTXDirector(
             av_latent=get_value_at_index(samplercustomadvanced_19, 0)
         )
 
-        # --- Step 28: LTXVCropGuides #54 (replaces LTXDirectorCropGuides, final crop) ---
-        ltxvcropguides_54 = ltxvcropguides.EXECUTE_NORMALIZED(
-            positive=pass2_positive,
-            negative=pass2_negative,
+        # --- Step 28: LTXDirectorCropGuides #54 (final crop) ---
+        ltxdirectorcropguides_54 = ltxdirectorcropguides.EXECUTE_NORMALIZED(
+            positive=get_value_at_index(ltxdirectorguide_132, 0),
+            negative=get_value_at_index(ltxdirectorguide_132, 1),
             latent=get_value_at_index(ltxvseparateavlatent_22, 0),
         )
 
@@ -955,7 +1032,7 @@ def mainLTXDirector(
         # --- Step 29: VAEDecode ---
         vaedecode = NODE_CLASS_MAPPINGS["VAEDecode"]()
         vaedecode_result = vaedecode.decode(
-            samples=get_value_at_index(ltxvcropguides_54, 2),
+            samples=get_value_at_index(ltxdirectorcropguides_54, 2),
             vae=get_value_at_index(vaeloader_36, 0),
         )
 
@@ -981,7 +1058,7 @@ def mainLTXDirector(
         vhs_videocombine_139 = vhs_videocombine.EXECUTE_NORMALIZED(
             images=get_value_at_index(vaedecode_result, 0),
             audio=get_value_at_index(ltxvaudiovaedecode_result, 0),
-            frame_rate=fps,
+            frame_rate=get_value_at_index(ltxdirector_131, 6),
             loop_count=0,
             filename_prefix="LTX2.3/Video",
             format="video/h264-mp4",

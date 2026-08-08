@@ -1,0 +1,7 @@
+{
+  "task_id": "task-restore-ltxdirector-pipeline",
+  "task_description": "Restore the LTXDirector, LTXDirectorGuide, and LTXDirectorCropGuides pipeline in ltx23_director_mv_30s.py. Fix the git clone URL to https://github.com/WhatDreamscost/WhatDreamsCost-ComfyUI.git and revert the standard-node workaround while preserving other valid fixes (model_download always returns filename, upload writes bytes directly, sequential LoraLoader, no ModelPreviewOverrideKJ).",
+  "status": "in_progress",
+  "feature_order": ["FEAT-001"],
+  "blocked_reason": null
+}

@@ -1,0 +1,19 @@
+{
+  "project_type": "Google Colab notebook (Python script converted from .ipynb) for ComfyUI video generation",
+  "language": "Python",
+  "build_system": "None (Colab notebook, no build system)",
+  "test_framework": "None (manual Colab execution)",
+  "build_command": "python3 -c \"import ast; ast.parse(open('ltx23_director_mv_30s.py').read()); print('Syntax OK')\"",
+  "test_command": "python3 -c \"import ast; ast.parse(open('ltx23_director_mv_30s.py').read()); print('Syntax OK')\"",
+  "verification_instructions": "1. Run python3 syntax check on ltx23_director_mv_30s.py to confirm no syntax errors. 2. Verify LTXDirector, LTXDirectorGuide, LTXDirectorCropGuides nodes are used in the pipeline. 3. Verify git clone URL is https://github.com/WhatDreamscost/WhatDreamsCost-ComfyUI.git",
+  "snapshot_or_generated_files": null,
+  "setup_instructions": "No setup needed - this is a Python script that runs on Google Colab",
+  "environment_constraints": "Cannot run the actual pipeline (requires GPU, ComfyUI, etc). Validation limited to AST parsing and code inspection.",
+  "contribution_requirements": "Commit on the current branch feat/ltx23-director-colab-notebook. Do NOT push.",
+  "key_patterns": "The script uses NODE_CLASS_MAPPINGS[\"NodeName\"]() to instantiate ComfyUI nodes, then calls .EXECUTE_NORMALIZED() with kwargs. get_value_at_index() extracts tuple outputs. The pre-rewrite version at commit 4feb2b8 shows the correct LTXDirector pipeline pattern. Key fixes to PRESERVE: model_download() always returns filename, upload functions write bytes directly (not shutil.move), LoRA loading uses sequential LoraLoader, ModelPreviewOverrideKJ removed.",
+  "relevant_files": [
+    "ltx23_director_mv_30s.py",
+    "LTX-2.3_Director_2.0-MV-Workflow-30s.json"
+  ],
+  "directory_structure": "Root contains: ltx23_director_mv_30s.py (main file to fix), LTX-2.3_Director_2.0-MV-Workflow-30s.json (reference workflow), ltx2_ti2v_distilled.py (unrelated)"
+}
