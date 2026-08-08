@@ -50,7 +50,7 @@ import subprocess
 # %cd /content/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite
 !pip install -r requirements.txt
 # %cd /content/ComfyUI/custom_nodes/WhatDreamsCost-ComfyUI
-!pip install -r requirements.txt
+!pip install -e .
 
 def install_apt_packages():
     packages = ['aria2', 'ffmpeg']
@@ -821,25 +821,39 @@ def mainLTXDirector(
         # Local prompts: empty per-segment prompts separated by " | "
         local_prompts_str = " | ".join([""] * max(num_images, 1))
 
+        # Compute time/frame boundaries for the director
+        duration_seconds = frames / fps
         ltxdirector_131 = ltxdirector.EXECUTE_NORMALIZED(
             # Linked inputs (from other nodes)
             model=get_value_at_index(powerloraloaderrgthree_138, 0),
             clip=get_value_at_index(powerloraloaderrgthree_138, 1),
-            audio_vae=get_value_at_index(vaeloader_8, 0),
-            # STRING input slot
-            global_prompt=global_prompt,
+            # Required positional time/frame parameters
+            start_second=0,
+            end_second=duration_seconds,
+            duration_seconds=duration_seconds,
+            start_frame=0,
+            end_frame=frames,
+            duration_frames=frames,
             # Widget parameters
             timeline_data=timeline_data_json,
             local_prompts=local_prompts_str,
             segment_lengths=segment_lengths_str,
-            epsilon=0.001,
+            # STRING input slot
+            global_prompt=global_prompt,
             guide_strength=guide_strength_str,
+            epsilon=0.001,
             frame_rate=fps,
+            display_mode="seconds",
             custom_width=width,
             custom_height=height,
             resize_method="maintain aspect ratio",
             divisible_by=32,
             img_compression=18,
+            audio_vae=get_value_at_index(vaeloader_8, 0),
+            use_custom_audio=True if audio_path else False,
+            inpaint_audio=True,
+            use_custom_motion=True,
+            override_audio=False,
         )
 
         # Delete clip after LTXDirector has encoded the prompt
