@@ -2,7 +2,7 @@
   "id": "FEAT-001",
   "type": "fix",
   "description": "Fix CUDA OOM from DiT double-load, add model cache, fix custom node import failures (PromptServer mock, kornia compat), and update generate_chunk to avoid redundant model loads.",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "Add _DIT_MODEL_CACHE global and cache logic to load_dit_model()",
     "Add release_dit_model() function to clear cache and free memory",
