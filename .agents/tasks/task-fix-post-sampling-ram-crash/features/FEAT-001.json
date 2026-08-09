@@ -2,7 +2,7 @@
   "id": "FEAT-001",
   "type": "fix",
   "description": "Fix post-sampling system RAM crash on Colab T4 by: (1) unloading DiT/base_model and upscaler BEFORE VAE decode, (2) adding frame-streaming decode_video_latent that decodes in sub-batches and pipes frames directly to ffmpeg without holding full frame tensor in RAM, (3) rewriting _write_chunk_via_ffmpeg to accept frames one-at-a-time (streaming) instead of converting the entire tensor to numpy at once, (4) adding RAM safety checks before decode operations, (5) adding a cpu_ram_cleanup helper to the LTXMemoryManager class.",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "Step 1 - Add RAM safety method to LTXMemoryManager (SECTION 3, around line 450-600): Add `is_ram_safe(self, required_gb: float = 2.0) -> bool` that returns True if cpu_available_gb() > required_gb. Add `ram_cleanup(self)` that calls gc.collect() repeatedly and logs RAM state. Add `estimate_frame_ram_gb(self, num_frames: int, height: int, width: int) -> float` that calculates expected RAM for decoded frames (num_frames * height * width * 3 * 4 / 1024^3 for float32).",
     "Step 2 - Modify generate_chunk() (SECTION 18, around line 2160-2395) to unload DiT/base_model and upscaler BEFORE VAE decode: After sampling pass 2 completes and sample_out_2 is obtained (after the existing `del latent_for_sampler2, model_g2, dit_model`), add explicit unloading of base_model (if it's not the same object already deleted as dit_model) using `del base_model` followed by `mem.aggressive_cleanup()`. The upscaler is already deleted at step 12 (`del lat_crop55, upscaler`) which is fine. Also add `del dir_model, dir_guide_data, dir_motion_guide_data, dir_positive, dir_video_latent, dir_audio_latent` after they are no longer needed (after Guide pass 2, step 13) to free any references the director holds.",
@@ -28,5 +28,5 @@
     "Grep for is_ram_safe or ram_cleanup to confirm new methods exist"
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "All 6 steps implemented successfully. AST parse passes. The file uses NameError try/except for safe deletion of variables (dir_positive, dir_video_latent, dir_audio_latent, base_model) that may have already been consumed by earlier assignments. Sub-batch decode uses temporal_compression=8 assumption for LTX model. The save_chunk_to_disk CreateVideo block was re-indented to fit under the new ram_too_low guard."
 }
