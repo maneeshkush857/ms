@@ -1540,6 +1540,11 @@ def build_director_conditioning(
         audio_vae = load_audio_vae()
 
         # Load CLIP via DualCLIPLoader (same as build_text_conditioning, workflow node 12)
+        # NOTE: The workflow routes CLIP through Power Lora Loader (node 138) before
+        # LTXDirector (node 131). However, all LoRAs in this pipeline are model-only
+        # (distilled, transition, mvcamera, omninft) and do not modify CLIP weights.
+        # LoraLoaderModelOnly is used for the DiT, which by design does not touch CLIP.
+        # Therefore passing raw CLIP here is correct and matches the effective behavior.
         dualcliploader = get_node("DualCLIPLoader")
         try:
             clip_result = dualcliploader.load_clip(
@@ -1867,8 +1872,11 @@ def separate_av_latent(sampler_output, output_index: int = 0) -> Tuple:
     """
     Split joint AV latent back into video + audio (workflow nodes 22 / 34).
     
-    For pass 1 (node 34): use output_index=0 (the raw output).
-    For pass 2 (node 22): use output_index=1 (the denoised_output).
+    For pass 1 (node 34): use output_index=0 (the output).
+    For pass 2 (node 22): use output_index=0 (the output).
+    
+    The workflow JSON wires SamplerCustomAdvanced slot 0 (output) to
+    LTXVSeparateAVLatent for both passes, matching this default.
     
     Returns (video_latent, audio_latent).
     """
@@ -2134,7 +2142,7 @@ def generate_chunk(
         12. LTXVConcatAVLatent (node 18): Guide132 latent + pass1 separated audio
         13. CFGGuider (node 17): uses Guide132 model/pos/neg
         14. SamplerCustomAdvanced (node 19): Pass 2 (4 steps, denoise=0.42)
-        15. LTXVSeparateAVLatent (node 22): pass2 output[1] (denoised_output)
+        15. LTXVSeparateAVLatent (node 22): pass2 output[0] (the output)
         16. LTXDirectorCropGuides (node 54): Guide132 pos/neg + separated video
         17. VAEDecode: CropGuides54 latent
         18. LTXVAudioVAEDecode: separated audio from pass2
@@ -2197,23 +2205,47 @@ def generate_chunk(
             video_latent_pass1 = dir_video_latent
             audio_latent_for_concat = dir_audio_latent
         else:
-            # Fallback: build empty latents the old way
+            # Fallback: build empty latents the old way.
+            # NOTE: build_empty_latents already fuses video+audio via LTXVConcatAVLatent
+            # internally, so the returned av_latent is already an AV-fused latent.
+            # We must NOT concat additional audio at step 8 (that would double-concat).
             av_latent_pass1, img_conditioned_lat = build_empty_latents(
                 num_frames, latent_w, latent_h, fps,
                 preprocessed, image_strength, image_bypass,
                 video_vae, audio_vae,
             )
             video_latent_pass1 = get_value_at_index(av_latent_pass1, 0)
-            audio_latent_for_concat = dir_audio_latent  # Fallback still has valid audio from _build_director_fallback
+            audio_latent_for_concat = None  # Already fused inside build_empty_latents
             del av_latent_pass1
             mem.soft_cleanup()
+
+        # -- 6b. Build Director-aware conditioning (workflow nodes 128 + 27) --
+        # When LTXDirector provides dir_positive (timeline-segmented conditioning),
+        # we must route it through ConditioningZeroOut -> LTXVConditioning to produce
+        # the pos/neg that Guide pass 1 receives. This is the Director's core value:
+        # multi-segment timeline data (image refs, audio markers, per-segment prompts).
+        if dir_positive is not None:
+            conditioningzeroout = get_node("ConditioningZeroOut")
+            neg_from_director = conditioningzeroout.zero_out(conditioning=dir_positive)
+            ltxvconditioning = get_node("LTXVConditioning")
+            director_cond = ltxvconditioning.EXECUTE_NORMALIZED(
+                frame_rate=dir_frame_rate,
+                positive=dir_positive,
+                negative=get_value_at_index(neg_from_director, 0),
+            )
+            cond_pos_for_guide = get_value_at_index(director_cond, 0)
+            cond_neg_for_guide = get_value_at_index(director_cond, 1)
+        else:
+            # Fallback: use plain text conditioning from build_text_conditioning
+            cond_pos_for_guide = pos_cond
+            cond_neg_for_guide = neg_cond
 
         # -- 7. LTXDirectorGuide pass 1 (workflow node 133: upscale_factor=0.5) --
         # Takes: pos/neg conditioning, VAE, video_latent from LTXDirector,
         #        guide_data, motion_guide_data, base model
         pos_g1, neg_g1, lat_g1, model_g1 = run_director_guide(
-            pos_cond=pos_cond,
-            neg_cond=neg_cond,
+            pos_cond=cond_pos_for_guide,
+            neg_cond=cond_neg_for_guide,
             video_vae=video_vae,
             latent=video_latent_pass1,
             guide_data=dir_guide_data,
