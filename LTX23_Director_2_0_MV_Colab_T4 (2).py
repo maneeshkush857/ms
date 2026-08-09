@@ -1634,16 +1634,94 @@ def build_director_conditioning(
         director_cls = NODE_CLASS_MAPPINGS["LTXDirector"]
         director = director_cls()
 
-        # Build kwargs matching the node's input spec
+        # Introspect INPUT_TYPES to discover what the execute function accepts.
+        # This is the safe ComfyUI pattern: only pass params the node declares.
+        try:
+            input_types = director_cls.INPUT_TYPES()
+        except Exception:
+            input_types = {"required": {}, "optional": {}}
+        required_params = set(input_types.get("required", {}).keys())
+        optional_params = set(input_types.get("optional", {}).keys())
+        all_accepted = required_params | optional_params
+
+        # Core inputs (from workflow JSON node 131 linked inputs)
         director_kwargs = dict(
             model=dit_model,
             audio_vae=audio_vae,
             global_prompt=GLOBAL_PROMPT,
         )
 
-        # Add optional inputs if available
+        # Add CLIP if the node accepts it (CLIP is a linked input in the workflow)
         if clip_model is not None:
-            director_kwargs["clip"] = clip_model
+            if not all_accepted or "clip" in all_accepted:
+                director_kwargs["clip"] = clip_model
+
+        # Widget values (from workflow JSON node 131 widgets_values).
+        # These are required positional args for the execute() function.
+        # Compute from current chunk parameters for correctness.
+        total_frames = num_frames
+        duration_s = total_frames / fps
+        widget_defaults = {
+            "start_second": 0,
+            "end_second": duration_s,
+            "duration_seconds": duration_s,
+            "start_frame": 0,
+            "end_frame": total_frames,
+            "duration_frames": total_frames,
+            "timeline_data": json.dumps({
+                "mainTrackEnabled": True,
+                "audioTrackEnabled": True,
+                "motionTrackEnabled": True,
+                "propHeight": 90,
+                "globalPropHeight": 470,
+                "showFilenames": True,
+                "overrideAudio": False,
+                "inpaint_audio": True,
+                "global_prompt": GLOBAL_PROMPT,
+                "retake_global_prompt": "",
+                "retakeMode": False,
+                "retakeStart": 24,
+                "retakeLength": 48,
+                "retakePrompt": "",
+                "retakeStrength": 1,
+                "retakeVideo": None,
+                "normalStartFrame": 0,
+                "normalDurationFrames": total_frames,
+                "segments": [],
+                "motionSegments": [],
+                "audioSegments": [],
+            }),
+            "local_prompts": "",
+            "segment_lengths": "",
+            "epsilon": 0.001,
+            "guide_strength": "1.00",
+            "mainTrackEnabled": True,
+            "audioTrackEnabled": True,
+            "motionTrackEnabled": True,
+            "frame_rate": fps,
+            "display_mode": "seconds",
+            "custom_width": width,
+            "custom_height": height,
+            "resize_method": "maintain aspect ratio",
+            "divisible_by": 32,
+            "img_compression": WORKFLOW_IMG_COMPRESSION,
+            "retakeMode": False,
+            "timeline_ui": "",
+        }
+
+        # Only add widget params that the node actually accepts
+        for param_name, default_val in widget_defaults.items():
+            if param_name in all_accepted:
+                director_kwargs[param_name] = default_val
+
+        # If introspection found no params (fallback), add the 9 required ones
+        # that the error message told us about
+        if not all_accepted:
+            for param_name in ["start_second", "end_second", "duration_seconds",
+                               "start_frame", "end_frame", "duration_frames",
+                               "timeline_data", "local_prompts", "segment_lengths"]:
+                if param_name not in director_kwargs:
+                    director_kwargs[param_name] = widget_defaults[param_name]
 
         # WhatDreamsCost custom nodes define their execution function name via
         # the FUNCTION class attribute (standard ComfyUI pattern). Use that
@@ -1742,24 +1820,57 @@ def run_director_guide(
     guide_cls = NODE_CLASS_MAPPINGS["LTXDirectorGuide"]
     guide_node = guide_cls()
 
+    # Introspect INPUT_TYPES to discover what the execute function actually accepts.
+    # This prevents passing unexpected kwargs (e.g. 'retake_image' which may not exist).
+    try:
+        input_types = guide_cls.INPUT_TYPES()
+    except Exception:
+        input_types = {"required": {}, "optional": {}}
+    required_params = set(input_types.get("required", {}).keys())
+    optional_params = set(input_types.get("optional", {}).keys())
+    all_accepted = required_params | optional_params
+
+    # Core linked inputs (always needed)
     inputs = dict(
         positive=pos_cond,
         negative=neg_cond,
         vae=video_vae,
         latent=latent,
         model=model,
-        retake_image="None",
-        upscale_factor_pass=1,
-        upscale_factor=upscale_factor,
-        interpolation="bicubic",
-        blend_radius=1,
-        crop_method="center",
-        use_tiling=True,
-        tile_overlap=False,
-        tile_size=256,
-        tile_stride=64,
-        force_inpaint=False,
     )
+
+    # Widget values from workflow JSON (node 132/133)
+    # Order in widgets_values: [retake_image, upscale_factor_pass, upscale_factor,
+    #   interpolation, blend_radius, crop_method, use_tiling, tile_overlap,
+    #   tile_size, tile_stride, force_inpaint]
+    # BUT: the actual param names accepted by execute() may differ.
+    # Use introspection to only pass what the node declares.
+    widget_candidates = {
+        "retake_image": "None",
+        "upscale_factor_pass": 1,
+        "upscale_factor": upscale_factor,
+        "interpolation": "bicubic",
+        "blend_radius": 1,
+        "crop_method": "center",
+        "use_tiling": True,
+        "tile_overlap": False,
+        "tile_size": 256,
+        "tile_stride": 64,
+        "force_inpaint": False,
+    }
+
+    if all_accepted:
+        # Only pass widget params that the node actually declares
+        for param_name, val in widget_candidates.items():
+            if param_name in all_accepted:
+                inputs[param_name] = val
+    else:
+        # No introspection available - pass all widget params EXCEPT retake_image
+        # (which is known to cause errors per runtime feedback)
+        for param_name, val in widget_candidates.items():
+            if param_name != "retake_image":
+                inputs[param_name] = val
+
     if guide_data is not None:
         inputs["guide_data"] = guide_data
     if motion_guide_data is not None:
@@ -2340,8 +2451,11 @@ def generate_chunk(
         video_vae = load_video_vae()
         audio_vae = load_audio_vae()
 
-        # -- 3. Load upscaler --
-        upscaler = load_upscaler_model()
+        # -- 3. Load upscaler (DEFERRED until after pass 1 to reduce VRAM pressure) --
+        # The upscaler is only needed for step 12 (between pass 1 and pass 2).
+        # Loading it here would consume VRAM during pass 1 sampling, causing OOM
+        # on T4 GPUs where DiT + LoRAs already use most of the 15 GB.
+        upscaler = None  # Will be loaded after pass 1 completes
 
         # -- 4. Build LTXDirector conditioning or fallback --
         # DiT model is loaded inside build_director_conditioning (or its fallback)
@@ -2475,6 +2589,8 @@ def generate_chunk(
 
         # -- 12. 2x latent spatial upscale (workflow node 14) --
         # Takes CropGuides55's latent output (slot 2)
+        # Load upscaler NOW (deferred from step 3 to avoid VRAM pressure during pass 1)
+        upscaler = load_upscaler_model()
         upscaled_lat = upsample_video_latent(lat_crop55, upscaler, video_vae)
         del lat_crop55, upscaler
         mem.cleanup()
