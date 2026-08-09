@@ -1631,7 +1631,8 @@ def build_director_conditioning(
             )
         clip_model = get_value_at_index(clip_result, 0)
 
-        director = NODE_CLASS_MAPPINGS["LTXDirector"]()
+        director_cls = NODE_CLASS_MAPPINGS["LTXDirector"]
+        director = director_cls()
 
         # Build kwargs matching the node's input spec
         director_kwargs = dict(
@@ -1644,16 +1645,21 @@ def build_director_conditioning(
         if clip_model is not None:
             director_kwargs["clip"] = clip_model
 
+        # WhatDreamsCost custom nodes define their execution function name via
+        # the FUNCTION class attribute (standard ComfyUI pattern). Use that
+        # instead of EXECUTE_NORMALIZED which only exists on core nodes.
         try:
-            director_out = director.EXECUTE_NORMALIZED(**director_kwargs)
-        except TypeError:
-            # Fallback: try with execute method
-            try:
-                director_out = director.execute(**director_kwargs)
-            except TypeError:
-                print("  LTXDirector call failed -- using fallback conditioning.")
-                return _build_director_fallback(pos_cond, neg_cond, num_frames, fps,
-                                               dit_model=dit_model, audio_vae=audio_vae)
+            func_name = getattr(director_cls, "FUNCTION", None)
+            if func_name:
+                func = getattr(director, func_name)
+                director_out = func(**director_kwargs)
+            else:
+                # Last resort: try EXECUTE_NORMALIZED (core nodes)
+                director_out = director.EXECUTE_NORMALIZED(**director_kwargs)
+        except (TypeError, AttributeError) as e:
+            print(f"  LTXDirector call failed ({e}) -- using fallback conditioning.")
+            return _build_director_fallback(pos_cond, neg_cond, num_frames, fps,
+                                           dit_model=dit_model, audio_vae=audio_vae)
 
         # Extract all outputs per workflow node 131 output slots
         dir_model       = get_value_at_index(director_out, 0)
@@ -1733,7 +1739,8 @@ def run_director_guide(
         print(f"  LTXDirectorGuide not found ({node_id}) -- passthrough.")
         return pos_cond, neg_cond, latent, model
 
-    guide_node = NODE_CLASS_MAPPINGS["LTXDirectorGuide"]()
+    guide_cls = NODE_CLASS_MAPPINGS["LTXDirectorGuide"]
+    guide_node = guide_cls()
 
     inputs = dict(
         positive=pos_cond,
@@ -1759,13 +1766,17 @@ def run_director_guide(
         inputs["motion_guide_data"] = motion_guide_data
 
     try:
-        out = guide_node.EXECUTE_NORMALIZED(**inputs)
-    except TypeError:
-        try:
-            out = guide_node.execute(**inputs)
-        except Exception as e:
-            print(f"  LTXDirectorGuide ({node_id}) failed: {e} -- passthrough.")
-            return pos_cond, neg_cond, latent, model
+        # WhatDreamsCost custom nodes use the FUNCTION class attribute to define
+        # their execution method name (standard ComfyUI node pattern).
+        func_name = getattr(guide_cls, "FUNCTION", None)
+        if func_name:
+            func = getattr(guide_node, func_name)
+            out = func(**inputs)
+        else:
+            out = guide_node.EXECUTE_NORMALIZED(**inputs)
+    except (TypeError, AttributeError) as e:
+        print(f"  LTXDirectorGuide ({node_id}) failed: {e} -- passthrough.")
+        return pos_cond, neg_cond, latent, model
 
     pos_out   = get_value_at_index(out, 0)
     neg_out   = get_value_at_index(out, 1)
@@ -1798,15 +1809,20 @@ def run_director_crop_guides(pos_cond, neg_cond, latent) -> Tuple:
             print("  No crop guides node found -- passthrough.")
             return pos_cond, neg_cond, latent
     else:
-        crop_node = NODE_CLASS_MAPPINGS["LTXDirectorCropGuides"]()
+        crop_cls = NODE_CLASS_MAPPINGS["LTXDirectorCropGuides"]
+        crop_node = crop_cls()
+        crop_kwargs = dict(positive=pos_cond, negative=neg_cond, latent=latent)
         try:
-            out = crop_node.EXECUTE_NORMALIZED(
-                positive=pos_cond, negative=neg_cond, latent=latent
-            )
-        except TypeError:
-            out = crop_node.execute(
-                positive=pos_cond, negative=neg_cond, latent=latent
-            )
+            # WhatDreamsCost custom nodes use the FUNCTION class attribute
+            func_name = getattr(crop_cls, "FUNCTION", None)
+            if func_name:
+                func = getattr(crop_node, func_name)
+                out = func(**crop_kwargs)
+            else:
+                out = crop_node.EXECUTE_NORMALIZED(**crop_kwargs)
+        except (TypeError, AttributeError) as e:
+            print(f"  LTXDirectorCropGuides failed: {e} -- passthrough.")
+            return pos_cond, neg_cond, latent
 
     pos_out = get_value_at_index(out, 0) if get_value_at_index(out, 0) is not None else pos_cond
     neg_out = get_value_at_index(out, 1) if get_value_at_index(out, 1) is not None else neg_cond
