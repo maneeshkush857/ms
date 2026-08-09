@@ -2,7 +2,7 @@
   "id": "FEAT-001",
   "type": "fix",
   "description": "Fix all critical bugs in the LTX23 Director 2.0 MV pipeline by correcting the two-pass sampling parameters, pipeline execution order, LTXDirectorGuide integration, LTXDirector node invocation, and separate_av_latent indexing to match the ComfyUI workflow JSON exactly.",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "STEP 1 - Fix Pass 2 sampling parameters (Section 15, run_sampling_pass function): The workflow JSON node 21 (BasicScheduler for pass 2) uses steps=4 and denoise=0.42, but the script hardcodes WORKFLOW_STEPS=8 and denoise=1.0 for both passes. Add separate constants WORKFLOW_STEPS_PASS2=4 and WORKFLOW_DENOISE_PASS2=0.42. Update run_sampling_pass() to accept a denoise parameter (default 1.0). Update the pass 2 call in generate_chunk() to pass steps=4 and denoise=0.42.",
     "STEP 2 - Fix separate_av_latent index for Pass 2 (Section 18, generate_chunk function): The reference experiment_ltx23.py uses get_value_at_index(samplercustomadvanced_119, 1) for pass 2 output (index 1 = denoised_output). The current script uses index 0 for both passes. Fix the pass 2 separate_av_latent call to use index 1 from the sampler output. SamplerCustomAdvanced returns (output, denoised_output) - pass 1 uses output[0], pass 2 refinement uses output[1].",
@@ -32,5 +32,5 @@
     "grep -n 'denoise=0.42\\|denoise=WORKFLOW_DENOISE_PASS2' '/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py'"
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "All 9 bugs fixed successfully. Python syntax and AST validation both pass. Key changes: (1) Added pass 2 constants WORKFLOW_STEPS_PASS2=4, WORKFLOW_DENOISE_PASS2=0.42; (2) separate_av_latent now accepts output_index param (pass2 uses 1); (3) run_sampling_pass now accepts denoise param; (4) generate_chunk completely rewritten to match workflow JSON execution order; (5) LTXDirectorGuide uses all correct widget params via EXECUTE_NORMALIZED; (6) build_director_conditioning properly returns 7-tuple with video_latent/audio_latent; (7) Two distinct CropGuides calls (node 55 for pass1, node 54 for pass2); (8) Final decode uses CropGuides54 latent output; (9) Guide outputs feed into CFGGuider, not original conditioning. recondition_image_on_upscaled is no longer called in the main path (superseded by correct workflow where upsampled latent goes directly to Guide132)."
 }
