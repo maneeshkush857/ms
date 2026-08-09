@@ -590,6 +590,24 @@ class LTXMemoryManager:
             print(f"  WARNING: GPU memory below safety threshold ({free:.2f} GB < {self.safety_margin_gb:.2f} GB). Starting cleanup.")
             self.aggressive_cleanup()
 
+    # ── RAM safety helpers ────────────────────────────────────────────────────
+
+    def is_ram_safe(self, required_gb: float = 2.0) -> bool:
+        """Return True if available system RAM exceeds required_gb."""
+        return self.cpu_available_gb() > required_gb
+
+    def ram_cleanup(self):
+        """Aggressive system RAM cleanup: 3x gc.collect() + log RAM state."""
+        for _ in range(3):
+            gc.collect()
+        if self.enable_logging:
+            print(f"  [mem] RAM cleanup done. Available: {self.cpu_available_gb():.2f} GB, "
+                  f"Used: {self.cpu_used_gb():.2f} GB")
+
+    def estimate_frame_ram_gb(self, num_frames: int, height: int, width: int) -> float:
+        """Estimate RAM (GB) needed to hold decoded frames as float32 (N, H, W, 3)."""
+        return num_frames * height * width * 3 * 4 / (1024 ** 3)
+
 # Singleton instance used throughout
 mem = LTXMemoryManager(
     safety_margin_gb=CONFIG["gpu_safety_margin_gb"],
@@ -1941,15 +1959,74 @@ def recondition_image_on_upscaled(
 # SECTION 16 — VAE DECODING (chunked, never full-video at once)
 # =============================================================================
 
-def decode_video_latent(video_latent, video_vae) -> Any:
+def decode_video_latent(video_latent, video_vae, max_batch_frames: int = 0) -> Any:
     """
     Decode video latent to pixel frames using VAEDecode.
     This is called per temporal chunk so the full 30-second video is
     never decoded into GPU memory simultaneously.
+
+    When system RAM is low, decodes in sub-batches of 8 latent temporal
+    frames to avoid a single massive CPU allocation.
+
+    Args:
+        video_latent: Latent tensor dict with key "samples" of shape (B, C, T, H, W).
+        video_vae: The loaded VAE model.
+        max_batch_frames: If >0, force sub-batch decoding with this many latent
+                          temporal frames per batch. If 0 (default), auto-detect
+                          based on available RAM.
+
     Returns a frame tensor of shape (N, H, W, C) on CPU.
     """
     print("  VAE decoding video latent...")
     vaedecode = get_node("VAEDecode")
+
+    # Determine if sub-batch decoding is needed
+    latent_samples = video_latent["samples"] if isinstance(video_latent, dict) else video_latent
+    if torch.is_tensor(latent_samples) and latent_samples.ndim == 5:
+        # latent shape: (B, C, T_latent, H_latent, W_latent)
+        # Pixel frames ~ T_latent * temporal_compression (typically 8 for LTX)
+        t_latent = latent_samples.shape[2]
+        h_latent = latent_samples.shape[3]
+        w_latent = latent_samples.shape[4]
+        # Estimate pixel dimensions (8x spatial upscale from latent for LTX)
+        est_h = h_latent * 8
+        est_w = w_latent * 8
+        est_frames = t_latent * 8  # temporal compression factor
+        estimated_ram = mem.estimate_frame_ram_gb(est_frames, est_h, est_w)
+        available_ram = mem.cpu_available_gb()
+
+        use_subbatch = False
+        if max_batch_frames > 0:
+            use_subbatch = True
+            batch_t = max_batch_frames
+        elif available_ram < estimated_ram + 2.0:
+            use_subbatch = True
+            batch_t = 8  # 8 latent temporal frames per sub-batch
+            print(f"  [mem] Low RAM detected ({available_ram:.2f} GB available, "
+                  f"~{estimated_ram:.2f} GB needed). Using sub-batch decode "
+                  f"(batch_t={batch_t}).")
+
+        if use_subbatch and t_latent > batch_t:
+            # Sub-batch decode along temporal dimension
+            all_frames = []
+            for t_start in range(0, t_latent, batch_t):
+                t_end = min(t_start + batch_t, t_latent)
+                sub_latent_tensor = latent_samples[:, :, t_start:t_end, :, :]
+                sub_latent = {"samples": sub_latent_tensor}
+                decoded = vaedecode.decode(samples=sub_latent, vae=video_vae)
+                frames_gpu = get_value_at_index(decoded, 0)
+                frames_batch_cpu = frames_gpu.detach().to("cpu", non_blocking=False)
+                torch.cuda.synchronize()
+                all_frames.append(frames_batch_cpu)
+                del frames_gpu, decoded, sub_latent, sub_latent_tensor
+                mem.cleanup()
+
+            frames_cpu = torch.cat(all_frames, dim=0)
+            del all_frames
+            mem.soft_cleanup()
+            return frames_cpu
+
+    # Standard full decode (original behavior)
     decoded = vaedecode.decode(samples=video_latent, vae=video_vae)
     frames_gpu = get_value_at_index(decoded, 0)
 
@@ -2011,42 +2088,49 @@ def save_chunk_to_disk(
     chunk_path = os.path.join(chunks_dir, f"chunk_{chunk_index:04d}.mp4")
 
     # ── Try ComfyUI CreateVideo node ─────────────────────────────────────────
-    try:
-        from nodes import NODE_CLASS_MAPPINGS
-        if "CreateVideo" in NODE_CLASS_MAPPINGS:
-            createvideo = NODE_CLASS_MAPPINGS["CreateVideo"]()
-            video_obj = createvideo.EXECUTE_NORMALIZED(
-                fps=fps,
-                images=frames_cpu,
-                audio=audio_cpu,
-            )
-            video = get_value_at_index(video_obj, 0)
-            # Save using ComfyUI API
-            import folder_paths
-            from comfy_api.latest import Types
-            w = frames_cpu.shape[2] if frames_cpu.ndim == 4 else width
-            h = frames_cpu.shape[1] if frames_cpu.ndim == 4 else height
-            full_folder, fname, counter, _, _ = folder_paths.get_save_image_path(
-                f"chunk_{chunk_index:04d}",
-                folder_paths.get_output_directory(),
-                w, h,
-            )
-            ext = Types.VideoContainer.get_extension("auto")
-            tmp_path = os.path.join(full_folder, f"{fname}_{counter:05d}_.{ext}")
-            video.save_to(
-                tmp_path,
-                format=Types.VideoContainer("auto"),
-                codec="auto",
-                metadata=None,
-            )
-            # Move to our chunks directory
-            shutil.move(tmp_path, chunk_path)
-            del video_obj, video
-            mem.soft_cleanup()
-            print(f"  ✓ Chunk {chunk_index:04d} saved (CreateVideo): {chunk_path}")
-            return chunk_path
-    except Exception as e:
-        print(f"  CreateVideo path failed ({e}), falling back to ffmpeg pipe...")
+    # Skip CreateVideo when RAM is low to avoid buffering all frames in memory
+    ram_too_low = not mem.is_ram_safe(required_gb=4.0)
+    if ram_too_low:
+        print(f"  [mem] RAM too low ({mem.cpu_available_gb():.2f} GB available < 4.0 GB). "
+              f"Skipping CreateVideo, using streaming ffmpeg.")
+
+    if not ram_too_low:
+        try:
+            from nodes import NODE_CLASS_MAPPINGS
+            if "CreateVideo" in NODE_CLASS_MAPPINGS:
+                createvideo = NODE_CLASS_MAPPINGS["CreateVideo"]()
+                video_obj = createvideo.EXECUTE_NORMALIZED(
+                    fps=fps,
+                    images=frames_cpu,
+                    audio=audio_cpu,
+                )
+                video = get_value_at_index(video_obj, 0)
+                # Save using ComfyUI API
+                import folder_paths
+                from comfy_api.latest import Types
+                w = frames_cpu.shape[2] if frames_cpu.ndim == 4 else width
+                h = frames_cpu.shape[1] if frames_cpu.ndim == 4 else height
+                full_folder, fname, counter, _, _ = folder_paths.get_save_image_path(
+                    f"chunk_{chunk_index:04d}",
+                    folder_paths.get_output_directory(),
+                    w, h,
+                )
+                ext = Types.VideoContainer.get_extension("auto")
+                tmp_path = os.path.join(full_folder, f"{fname}_{counter:05d}_.{ext}")
+                video.save_to(
+                    tmp_path,
+                    format=Types.VideoContainer("auto"),
+                    codec="auto",
+                    metadata=None,
+                )
+                # Move to our chunks directory
+                shutil.move(tmp_path, chunk_path)
+                del video_obj, video
+                mem.soft_cleanup()
+                print(f"  \u2713 Chunk {chunk_index:04d} saved (CreateVideo): {chunk_path}")
+                return chunk_path
+        except Exception as e:
+            print(f"  CreateVideo path failed ({e}), falling back to ffmpeg pipe...")
 
     # ── Fallback: write frames via ffmpeg stdin pipe ──────────────────────────
     _write_chunk_via_ffmpeg(frames_cpu, audio_cpu, chunk_path, fps, width, height)
@@ -2055,16 +2139,15 @@ def save_chunk_to_disk(
 
 def _write_chunk_via_ffmpeg(frames_cpu, audio_cpu, out_path: str, fps: int, w: int, h: int):
     """
-    Pipe raw RGB frames directly into ffmpeg. Avoids holding a decoded frame
-    list in RAM by streaming one frame at a time.
+    Pipe raw RGB frames directly into ffmpeg. Streams one frame at a time
+    to avoid doubling RAM with a full numpy copy of the frame tensor.
     """
-    # Ensure frames are uint8 numpy
     if torch.is_tensor(frames_cpu):
-        frames_np = (frames_cpu.clamp(0, 1) * 255).byte().numpy()  # (N, H, W, 3)
+        n_frames = frames_cpu.shape[0]
+        fh, fw = frames_cpu.shape[1], frames_cpu.shape[2]
     else:
-        frames_np = frames_cpu
-
-    n_frames, fh, fw, _ = frames_np.shape
+        # Already numpy
+        n_frames, fh, fw = frames_cpu.shape[0], frames_cpu.shape[1], frames_cpu.shape[2]
 
     cmd = [
         "ffmpeg", "-y",
@@ -2081,14 +2164,21 @@ def _write_chunk_via_ffmpeg(frames_cpu, audio_cpu, out_path: str, fps: int, w: i
         out_path,
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    # Stream frame-by-frame to keep RAM usage constant
     for i in range(n_frames):
-        proc.stdin.write(frames_np[i].tobytes())
-        # Release each frame after writing to avoid doubling RAM
+        if torch.is_tensor(frames_cpu):
+            frame = (frames_cpu[i].clamp(0, 1) * 255).byte().numpy()
+        else:
+            frame = frames_cpu[i]
+        proc.stdin.write(frame.tobytes())
+        del frame
         if i % 16 == 0:
             gc.collect()
+
     proc.stdin.close()
     proc.wait()
-    print(f"  ✓ Chunk saved (ffmpeg pipe): {out_path}")
+    print(f"  \u2713 Chunk saved (ffmpeg pipe, streaming): {out_path}")
 
 
 def compute_file_checksum(path: str) -> str:
@@ -2327,6 +2417,24 @@ def generate_chunk(
         mem.cleanup()
         mem.warn_if_low()
 
+        # ── Free director tensors no longer needed after Guide pass 2 ────────
+        del dir_model, dir_guide_data, dir_motion_guide_data, dir_frame_rate
+        # dir_positive, dir_video_latent, dir_audio_latent may still be referenced
+        # via other names but ensure no stale references linger
+        try:
+            del dir_positive
+        except NameError:
+            pass
+        try:
+            del dir_video_latent
+        except NameError:
+            pass
+        try:
+            del dir_audio_latent
+        except NameError:
+            pass
+        mem.soft_cleanup()
+
         # -- 14. LTXVConcatAVLatent (workflow node 18) --
         # Concatenates Guide132's latent(2) + pass1 separated audio_latent(1)
         ltxvconcatavlatent2 = get_node("LTXVConcatAVLatent")
@@ -2353,6 +2461,11 @@ def generate_chunk(
         )
 
         del latent_for_sampler2, model_g2, dit_model
+        # Ensure no lingering reference to base_model keeps the DiT alive
+        try:
+            del base_model
+        except NameError:
+            pass
         mem.cleanup()
 
         # -- 16. Separate final AV latent (workflow node 22) --
@@ -2370,7 +2483,11 @@ def generate_chunk(
             latent=final_video_lat,
         )
         del pos_g2, neg_g2, final_video_lat, pos_crop54, neg_crop54
-        mem.soft_cleanup()
+        mem.aggressive_cleanup()
+        mem.ram_cleanup()
+        if not mem.is_ram_safe(required_gb=3.0):
+            print(f"  WARNING: System RAM critically low before decode "
+                  f"({mem.cpu_available_gb():.2f} GB available < 3.0 GB).")
 
         # -- 18. Decode video (workflow node 1: VAEDecode) --
         # Uses CropGuides54's latent output (slot 2)
