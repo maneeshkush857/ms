@@ -908,27 +908,54 @@ def _neutralize_comfy_kitchen():
             # comfy_kitchen triggers the Config(deprecated=) bug — replace it.
             pass
 
-    # Build a recursive stub module that raises ImportError for all attribute access.
-    # This causes quant_ops.py to fall through to its `except ImportError` branch
-    # and use pure-PyTorch quantization instead.
+    # Build a stub module that raises ImportError only for non-dunder attribute access.
+    #
+    # CRITICAL CONSTRAINT — do NOT raise on dunder names:
+    #   Python's inspect.py iterates sys.modules and calls
+    #       hasattr(module, '__file__')
+    #   for every module.  hasattr() catches ALL exceptions in Python 3, but the
+    #   caller (torchvision.__init__) runs this inside a for-loop where an
+    #   ImportError propagates out and crashes torchvision initialisation.
+    #   Solution: return None for dunder attributes so hasattr() returns False
+    #   cleanly without propagating any exception.
     import types
 
     class _ComfyKitchenStub(types.ModuleType):
-        """Stub that causes ComfyUI to fall back to pure-PyTorch quantization."""
+        """
+        Stub module that:
+        - Returns None for dunder/private attrs (__file__, __spec__, __loader__…)
+          so inspect.py / hasattr() / importlib work safely.
+        - Raises ImportError for all ComfyUI-facing public attributes
+          (QuantizedTensor, ck.*, etc.) so quant_ops.py falls back to
+          pure-PyTorch quantization.
+        """
         _is_ltx23_stub = True
+        # Explicitly set module-protocol dunders to safe sentinel values
+        __file__    = None
+        __spec__    = None
+        __loader__  = None
+        __package__ = "comfy_kitchen"
+        __path__    = []   # marks this as a package (allows sub-imports)
+        __all__     = []
 
         def __getattr__(self, name: str):
-            # Raising ImportError triggers ComfyUI's try/except ImportError fallback
+            # Let dunder lookups (and _is_ltx23_stub) pass through normally.
+            # Python calls __getattr__ only when the normal attribute lookup fails,
+            # so the class-level assignments above are returned first.
+            if name.startswith("__") and name.endswith("__"):
+                # Return None for unknown dunders — safe default for module protocol
+                return None
+            # For all public names, raise ImportError so ComfyUI's fallback fires
             raise ImportError(
-                f"comfy_kitchen.{name} is not available "
-                f"(comfy_kitchen neutralized for PyTorch 2.11 compatibility)"
+                f"comfy_kitchen is disabled for PyTorch 2.11 compatibility. "
+                f"Attribute '{name}' is not available. "
+                f"ComfyUI will use pure-PyTorch ops instead."
             )
 
         def __repr__(self):
-            return "<comfy_kitchen stub — PyTorch 2.11 compatibility shim>"
+            return "<comfy_kitchen — disabled for PyTorch 2.11 compatibility>"
 
-    # Register the stub for comfy_kitchen and all its sub-packages that
-    # quant_ops.py might try to import
+    # Register stubs for comfy_kitchen and every sub-package quant_ops.py imports
     stub_names = [
         "comfy_kitchen",
         "comfy_kitchen.tensor",
@@ -941,11 +968,10 @@ def _neutralize_comfy_kitchen():
     ]
     for mod_name in stub_names:
         stub = _ComfyKitchenStub(mod_name)
-        stub.__package__ = "comfy_kitchen"
-        stub.__path__ = []
+        stub.__name__ = mod_name
         sys.modules[mod_name] = stub
 
-    print("  ✓ comfy_kitchen neutralized (pure-PyTorch quantization fallback active).")
+    print("  ✓ comfy_kitchen neutralized (pure-PyTorch quantization active).")
 
 
 def setup_comfyui():
