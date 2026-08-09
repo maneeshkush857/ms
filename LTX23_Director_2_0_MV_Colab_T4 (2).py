@@ -348,6 +348,8 @@ WORKFLOW_SAMPLER_PASS1     = _SAMPLER_OVERRIDE
 WORKFLOW_SAMPLER_PASS2     = _SAMPLER_OVERRIDE
 WORKFLOW_SCHEDULER         = _SCHEDULER_OVERRIDE
 WORKFLOW_STEPS             = _STEPS_OVERRIDE
+WORKFLOW_STEPS_PASS2       = 4
+WORKFLOW_DENOISE_PASS2     = 0.42
 WORKFLOW_IMG_COMPRESSION   = _IMG_COMPRESSION_OVERRIDE
 
 # Global prompt — uses custom @param value if provided, otherwise the built-in workflow prompt
@@ -1511,55 +1513,79 @@ def build_director_conditioning(
     This is the WhatDreamsCost Director node that builds multi-segment timeline
     conditioning with image, audio and motion guide data.
 
+    LTXDirector outputs (per workflow JSON):
+        slot 0: model (passthrough/modified DiT)
+        slot 1: positive conditioning
+        slot 2: video_latent (replaces EmptyLTXVLatentVideo)
+        slot 3: audio_latent (replaces LTXVEmptyLatentAudio)
+        slot 4: guide_data
+        slot 5: motion_guide_data
+        slot 6: frame_rate
+
     If LTXDirector is not available in NODE_CLASS_MAPPINGS, falls back gracefully
     to standard LTX conditioning (single-image path) and logs the missing node.
 
     Returns:
-        (director_model_passthrough, pos_cond_out, neg_cond_out,
-         guide_data, motion_guide_data, audio_latent, frame_rate_signal)
+        (director_model, positive_cond, video_latent, audio_latent,
+         guide_data, motion_guide_data, frame_rate)
     """
     from nodes import NODE_CLASS_MAPPINGS
 
-    # ── LTXDirector path (WhatDreamsCost) ────────────────────────────────────
+    # -- LTXDirector path (WhatDreamsCost) --
     if "LTXDirector" in NODE_CLASS_MAPPINGS:
         print("  Using LTXDirector (WhatDreamsCost) node...")
 
         # Load models needed by Director
         dit_model = load_dit_model(apply_loras=True)
+        clip_model = None  # CLIP loaded separately via DualCLIPLoader
         audio_vae = load_audio_vae()
 
         director = NODE_CLASS_MAPPINGS["LTXDirector"]()
 
-        # Build timeline_data for this chunk — simplified from workflow JSON
-        # The full 5-segment timeline is in GLOBAL_PROMPT; for chunked generation
-        # we pass the segment images/prompts that fall within this chunk.
-        timeline_kwargs = dict(
+        # Build kwargs matching the node's input spec
+        director_kwargs = dict(
             model=dit_model,
-            clip=None,          # CLIP already encoded — conditioning passed directly
-            audio_vae=get_value_at_index((audio_vae,), 0),
+            audio_vae=audio_vae,
             global_prompt=GLOBAL_PROMPT,
         )
 
+        # Add optional inputs if available
+        if clip_model is not None:
+            director_kwargs["clip"] = clip_model
+
         try:
-            director_out = director.execute(**timeline_kwargs)
+            director_out = director.EXECUTE_NORMALIZED(**director_kwargs)
         except TypeError:
-            # Signature varies across Director versions — try positional
-            director_out = director.execute(
-                dit_model, None, audio_vae, GLOBAL_PROMPT
-            )
+            # Fallback: try with execute method
+            try:
+                director_out = director.execute(**director_kwargs)
+            except TypeError:
+                print("  LTXDirector call failed -- using fallback conditioning.")
+                return _build_director_fallback(pos_cond, neg_cond, num_frames, fps)
 
-        dir_model   = get_value_at_index(director_out, 0)
-        dir_pos     = get_value_at_index(director_out, 1)
-        dir_neg     = get_value_at_index(director_out, 2)
-        guide_data  = get_value_at_index(director_out, 3) if len(director_out) > 3 else None
-        motion_data = get_value_at_index(director_out, 4) if len(director_out) > 4 else None
-        audio_lat   = get_value_at_index(director_out, 5) if len(director_out) > 5 else None
-        fps_signal  = get_value_at_index(director_out, 6) if len(director_out) > 6 else fps
+        # Extract all outputs per workflow node 131 output slots
+        dir_model       = get_value_at_index(director_out, 0)
+        dir_positive    = get_value_at_index(director_out, 1)
+        dir_video_lat   = get_value_at_index(director_out, 2)
+        dir_audio_lat   = get_value_at_index(director_out, 3)
+        dir_guide_data  = get_value_at_index(director_out, 4) if len(director_out) > 4 else None
+        dir_motion_data = get_value_at_index(director_out, 5) if len(director_out) > 5 else None
+        dir_frame_rate  = get_value_at_index(director_out, 6) if len(director_out) > 6 else fps
 
-        return dir_model, dir_pos, dir_neg, guide_data, motion_data, audio_lat, fps_signal
+        return (dir_model, dir_positive, dir_video_lat, dir_audio_lat,
+                dir_guide_data, dir_motion_data, dir_frame_rate)
 
-    # ── Fallback: standard conditioning (no LTXDirector node) ────────────────
-    print("  ⚠ LTXDirector node not found — using standard conditioning fallback.")
+    # -- Fallback: standard conditioning (no LTXDirector node) --
+    return _build_director_fallback(pos_cond, neg_cond, num_frames, fps)
+
+
+def _build_director_fallback(pos_cond, neg_cond, num_frames: int, fps: int) -> Tuple:
+    """
+    Fallback when LTXDirector is not available.
+    Returns the same tuple shape as build_director_conditioning but with
+    None for guide_data, motion_guide_data, and generates empty audio latent.
+    """
+    print("  LTXDirector node not found -- using standard conditioning fallback.")
     dit_model = load_dit_model(apply_loras=True)
     audio_vae = load_audio_vae()
 
@@ -1571,7 +1597,8 @@ def build_director_conditioning(
         audio_vae=audio_vae,
     )
 
-    return dit_model, pos_cond, neg_cond, None, None, audio_lat, fps
+    # Return: model, positive, video_latent(None=use empty), audio_latent, guide, motion, fps
+    return dit_model, pos_cond, None, get_value_at_index(audio_lat, 0), None, None, fps
 
 
 def run_director_guide(
@@ -1587,15 +1614,20 @@ def run_director_guide(
 ) -> Tuple:
     """
     Run LTXDirectorGuide (workflow nodes 132 / 133).
-    Workflow node 132 (pass 2): upscale_factor=1, crop_center=True
-    Workflow node 133 (pass 1): upscale_factor=0.5, crop_center=True
+    Workflow node 133 (pass 1): upscale_factor=0.5
+    Workflow node 132 (pass 2): upscale_factor=1.0
+
+    Widget order: retake_image, upscale_factor_pass, upscale_factor, interpolation,
+                  blend_radius, crop_method, use_tiling, tile_overlap, tile_size,
+                  tile_stride, force_inpaint.
+    Inputs: positive, negative, vae, latent, guide_data, motion_guide_data, model.
 
     Returns (pos_out, neg_out, latent_out, model_out).
     Falls back to a passthrough if the node is unavailable.
     """
     from nodes import NODE_CLASS_MAPPINGS
     if "LTXDirectorGuide" not in NODE_CLASS_MAPPINGS:
-        print(f"  ⚠ LTXDirectorGuide not found ({node_id}) — passthrough.")
+        print(f"  LTXDirectorGuide not found ({node_id}) -- passthrough.")
         return pos_cond, neg_cond, latent, model
 
     guide_node = NODE_CLASS_MAPPINGS["LTXDirectorGuide"]()
@@ -1605,7 +1637,12 @@ def run_director_guide(
         negative=neg_cond,
         vae=video_vae,
         latent=latent,
+        model=model,
+        retake_image="None",
+        upscale_factor_pass=1,
         upscale_factor=upscale_factor,
+        interpolation="bicubic",
+        blend_radius=1,
         crop_method="center",
         use_tiling=True,
         tile_overlap=False,
@@ -1617,17 +1654,14 @@ def run_director_guide(
         inputs["guide_data"] = guide_data
     if motion_guide_data is not None:
         inputs["motion_guide_data"] = motion_guide_data
-    if model is not None:
-        inputs["model"] = model
 
     try:
-        out = guide_node.execute(**inputs)
+        out = guide_node.EXECUTE_NORMALIZED(**inputs)
     except TypeError:
-        # Some versions use different kwarg names
         try:
-            out = guide_node.EXECUTE_NORMALIZED(**inputs)
+            out = guide_node.execute(**inputs)
         except Exception as e:
-            print(f"  ⚠ LTXDirectorGuide ({node_id}) failed: {e} — passthrough.")
+            print(f"  LTXDirectorGuide ({node_id}) failed: {e} -- passthrough.")
             return pos_cond, neg_cond, latent, model
 
     pos_out   = get_value_at_index(out, 0)
@@ -1640,7 +1674,12 @@ def run_director_guide(
 def run_director_crop_guides(pos_cond, neg_cond, latent) -> Tuple:
     """
     Run LTXDirectorCropGuides (workflow nodes 54 / 55).
-    Crops conditioning to match upscaled latent resolution.
+    Crops conditioning to match the given latent resolution.
+
+    Node 55: takes Guide133's pos/neg + pass1 separated video_latent -> feeds upsampler
+    Node 54: takes Guide132's pos/neg + pass2 separated video_latent -> feeds VAEDecode
+
+    Returns (pos_out, neg_out, lat_out).
     """
     from nodes import NODE_CLASS_MAPPINGS
     if "LTXDirectorCropGuides" not in NODE_CLASS_MAPPINGS:
@@ -1653,14 +1692,18 @@ def run_director_crop_guides(pos_cond, neg_cond, latent) -> Tuple:
                 latent=latent,
             )
         else:
-            print("  ⚠ No crop guides node found — passthrough.")
+            print("  No crop guides node found -- passthrough.")
             return pos_cond, neg_cond, latent
     else:
         crop_node = NODE_CLASS_MAPPINGS["LTXDirectorCropGuides"]()
         try:
-            out = crop_node.execute(positive=pos_cond, negative=neg_cond, latent=latent)
+            out = crop_node.EXECUTE_NORMALIZED(
+                positive=pos_cond, negative=neg_cond, latent=latent
+            )
         except TypeError:
-            out = crop_node.EXECUTE_NORMALIZED(positive=pos_cond, negative=neg_cond, latent=latent)
+            out = crop_node.execute(
+                positive=pos_cond, negative=neg_cond, latent=latent
+            )
 
     pos_out = get_value_at_index(out, 0) if get_value_at_index(out, 0) is not None else pos_cond
     neg_out = get_value_at_index(out, 1) if get_value_at_index(out, 1) is not None else neg_cond
@@ -1748,6 +1791,7 @@ def run_sampling_pass(
     noise_seed: int,
     steps: int = WORKFLOW_STEPS,
     cfg: float = WORKFLOW_CFG,
+    denoise: float = 1.0,
     pass_name: str = "Pass1",
 ) -> Any:
     """
@@ -1758,7 +1802,7 @@ def run_sampling_pass(
     CFG=1 is correct for distilled models (guidance is baked into weights).
     Returns the raw output latent tuple.
     """
-    print(f"  Sampling {pass_name} ({steps} steps, seed={noise_seed})...")
+    print(f"  Sampling {pass_name} ({steps} steps, denoise={denoise}, seed={noise_seed})...")
 
     # Sampler — workflow nodes 20 / 32: both use "euler"
     ksamplerselect = get_node("KSamplerSelect")
@@ -1768,13 +1812,13 @@ def run_sampling_pass(
     randomnoise = get_node("RandomNoise")
     noise = randomnoise.EXECUTE_NORMALIZED(noise_seed=noise_seed)
 
-    # Sigma schedule — workflow node 33: linear_quadratic, 8 steps
+    # Sigma schedule — workflow nodes 33 (pass1: steps=8, denoise=1.0) / 21 (pass2: steps=4, denoise=0.42)
     basicscheduler = get_node("BasicScheduler")
     sigmas = basicscheduler.EXECUTE_NORMALIZED(
         model=model,
         scheduler=WORKFLOW_SCHEDULER,
         steps=steps,
-        denoise=1.0,
+        denoise=denoise,
     )
 
     # CFG guider (cfg=1 — distilled model)
@@ -1801,14 +1845,18 @@ def run_sampling_pass(
     return result
 
 
-def separate_av_latent(sampler_output) -> Tuple:
+def separate_av_latent(sampler_output, output_index: int = 0) -> Tuple:
     """
     Split joint AV latent back into video + audio (workflow nodes 22 / 34).
+    
+    For pass 1 (node 34): use output_index=0 (the raw output).
+    For pass 2 (node 22): use output_index=1 (the denoised_output).
+    
     Returns (video_latent, audio_latent).
     """
     ltxvseparateavlatent = get_node("LTXVSeparateAVLatent")
     separated = ltxvseparateavlatent.EXECUTE_NORMALIZED(
-        av_latent=get_value_at_index(sampler_output, 0)
+        av_latent=get_value_at_index(sampler_output, output_index)
     )
     video_lat = get_value_at_index(separated, 0)
     audio_lat = get_value_at_index(separated, 1)
@@ -2046,24 +2094,33 @@ def generate_chunk(
     """
     Generate one temporal chunk using the full LTX-2.3 Director 2.0 pipeline.
 
-    Pipeline (mirrors workflow JSON):
-        1.  Pre-process image for this chunk
-        2.  Load video VAE + audio VAE
-        3.  Build empty video + audio latents
-        4.  Apply LTXDirectorGuide pass 1 conditioning
-        5.  Sampling pass 1  (Euler, 8 steps, linear_quadratic)
-        6.  Separate AV latent
-        7.  LTXDirectorCropGuides
-        8.  2× latent upscale
-        9.  Re-condition image on upscaled latent
-        10. Apply LTXDirectorGuide pass 2 conditioning
-        11. Sampling pass 2  (Euler, 8 steps, linear_quadratic)
-        12. Separate AV latent (final)
-        13. VAE decode video
-        14. VAE decode audio
-        15. Save chunk to disk
-        16. Release all GPU tensors
-        17. Return lightweight metadata dict
+    Correct pipeline execution order (matching workflow JSON):
+        1.  Load VAEs, DiT model, upscaler
+        2.  Build LTXDirector conditioning (provides model, positive, video_latent,
+            audio_latent, guide_data, motion_guide_data, frame_rate)
+        3.  Build text conditioning (ConditioningZeroOut + LTXVConditioning)
+        4.  LTXDirectorGuide pass 1 (node 133, upscale_factor=0.5)
+            - Takes: conditioning pos/neg, VAE, LTXDirector video_latent,
+              guide_data, motion_guide_data, LTXDirector model
+            - Outputs: pos, neg, latent, model
+        5.  LTXVConcatAVLatent (node 29): Guide133 latent + LTXDirector audio_latent
+        6.  CFGGuider (node 28): uses Guide133 model/pos/neg
+        7.  SamplerCustomAdvanced (node 31): Pass 1 (8 steps, denoise=1.0)
+        8.  LTXVSeparateAVLatent (node 34): splits pass1 output[0]
+        9.  LTXDirectorCropGuides (node 55): Guide133 pos/neg + separated video
+        10. LTXVLatentUpsampler (node 14): CropGuides55 latent output
+        11. LTXDirectorGuide pass 2 (node 132, upscale_factor=1.0)
+            - Takes: CropGuides55 pos/neg, VAE, upsampled latent,
+              guide_data, motion_guide_data, LTXDirector model
+            - Outputs: pos, neg, latent, model
+        12. LTXVConcatAVLatent (node 18): Guide132 latent + pass1 separated audio
+        13. CFGGuider (node 17): uses Guide132 model/pos/neg
+        14. SamplerCustomAdvanced (node 19): Pass 2 (4 steps, denoise=0.42)
+        15. LTXVSeparateAVLatent (node 22): pass2 output[1] (denoised_output)
+        16. LTXDirectorCropGuides (node 54): Guide132 pos/neg + separated video
+        17. VAEDecode: CropGuides54 latent
+        18. LTXVAudioVAEDecode: separated audio from pass2
+        19. Save chunk to disk, release GPU tensors
 
     Returns dict with keys: chunk_index, start_frame, num_frames, fps, path.
     Never returns GPU tensors.
@@ -2080,132 +2137,205 @@ def generate_chunk(
         print(f"\n  GPU before chunk {idx}: {mem.gpu_free_gb():.2f} GB free")
 
     with torch.inference_mode():
-        # ── 1. Image preprocessing ────────────────────────────────────────────
+        # -- 1. Image preprocessing --
         preprocessed, latent_w, latent_h = prepare_image_for_chunk(
             loaded_image_tuple, width, height, img_compress, longer_edge
         )
 
-        # ── 2. Load VAEs ──────────────────────────────────────────────────────
+        # -- 2. Load VAEs --
         video_vae = load_video_vae()
         audio_vae = load_audio_vae()
 
-        # ── 3. Load DiT + LoRAs ───────────────────────────────────────────────
+        # -- 3. Load DiT + LoRAs --
         dit_model = load_dit_model(apply_loras=True)
 
-        # ── 4. Load upscaler ─────────────────────────────────────────────────
+        # -- 4. Load upscaler --
         upscaler = load_upscaler_model()
 
-        # ── 5. Build empty latents ────────────────────────────────────────────
-        av_latent_pass1, img_conditioned_lat = build_empty_latents(
-            num_frames, latent_w, latent_h, fps,
-            preprocessed, image_strength, image_bypass,
-            video_vae, audio_vae,
+        # -- 5. Build LTXDirector conditioning or fallback --
+        # LTXDirector returns: (model, positive, video_latent, audio_latent,
+        #                        guide_data, motion_guide_data, frame_rate)
+        director_result = build_director_conditioning(
+            pos_cond=pos_cond,
+            neg_cond=neg_cond,
+            image_path=None,
+            audio_path=None,
+            num_frames=num_frames,
+            fps=fps,
+            width=width,
+            height=height,
         )
+        (dir_model, dir_positive, dir_video_latent, dir_audio_latent,
+         dir_guide_data, dir_motion_guide_data, dir_frame_rate) = director_result
 
-        # ── 6. LTXDirectorGuide pass 1 (workflow node 133: upscale_factor=0.5) ─
+        # Use director model if available, otherwise use loaded dit_model
+        base_model = dir_model if dir_model is not None else dit_model
+
+        # -- 6. Determine video latent for pass 1 --
+        # When LTXDirector provides video_latent, use it directly (no empty latents needed).
+        # Otherwise fall back to building empty latents.
+        if dir_video_latent is not None:
+            # LTXDirector provides video_latent directly (replaces EmptyLTXVLatentVideo)
+            video_latent_pass1 = dir_video_latent
+            audio_latent_for_concat = dir_audio_latent
+        else:
+            # Fallback: build empty latents the old way
+            av_latent_pass1, img_conditioned_lat = build_empty_latents(
+                num_frames, latent_w, latent_h, fps,
+                preprocessed, image_strength, image_bypass,
+                video_vae, audio_vae,
+            )
+            video_latent_pass1 = get_value_at_index(av_latent_pass1, 0)
+            audio_latent_for_concat = None  # Will be inside the AV concat already
+            del av_latent_pass1
+            mem.soft_cleanup()
+
+        # -- 7. LTXDirectorGuide pass 1 (workflow node 133: upscale_factor=0.5) --
+        # Takes: pos/neg conditioning, VAE, video_latent from LTXDirector,
+        #        guide_data, motion_guide_data, base model
         pos_g1, neg_g1, lat_g1, model_g1 = run_director_guide(
             pos_cond=pos_cond,
             neg_cond=neg_cond,
             video_vae=video_vae,
-            latent=get_value_at_index(av_latent_pass1, 0),
-            guide_data=None,
-            motion_guide_data=None,
-            model=dit_model,
+            latent=video_latent_pass1,
+            guide_data=dir_guide_data,
+            motion_guide_data=dir_motion_guide_data,
+            model=base_model,
             upscale_factor=0.5,
-            node_id="pass1",
+            node_id="pass1 (node 133)",
         )
 
-        # ── 7. Sampling pass 1 ───────────────────────────────────────────────
+        # -- 8. LTXVConcatAVLatent (workflow node 29) --
+        # Concatenates Guide133's latent output + LTXDirector's audio_latent
+        if audio_latent_for_concat is not None:
+            ltxvconcatavlatent = get_node("LTXVConcatAVLatent")
+            av_concat_pass1 = ltxvconcatavlatent.EXECUTE_NORMALIZED(
+                video_latent=lat_g1,
+                audio_latent=audio_latent_for_concat,
+            )
+            latent_for_sampler1 = get_value_at_index(av_concat_pass1, 0)
+            del av_concat_pass1
+        else:
+            # Fallback path: latent already contains AV data
+            latent_for_sampler1 = lat_g1
+
+        # -- 9. Sampling pass 1 (workflow node 31: 8 steps, denoise=1.0) --
+        # CFGGuider (node 28) uses Guide133's model/pos/neg outputs
         sample_out_1 = run_sampling_pass(
             model=model_g1,
             pos_cond=pos_g1,
             neg_cond=neg_g1,
-            latent=lat_g1,
+            latent=latent_for_sampler1,
             noise_seed=chunk_seed,
             steps=WORKFLOW_STEPS,
             cfg=WORKFLOW_CFG,
+            denoise=1.0,
             pass_name=f"Pass1 (chunk {idx})",
         )
 
-        del pos_g1, neg_g1, lat_g1, av_latent_pass1
+        del latent_for_sampler1
         mem.cleanup()
         mem.warn_if_low()
 
-        # ── 8. Separate AV latent (workflow node 34) ──────────────────────────
-        video_lat_p1, audio_lat_p1 = separate_av_latent(sample_out_1)
+        # -- 10. Separate AV latent (workflow node 34) --
+        # Pass 1 uses output index 0 (raw output)
+        video_lat_p1, audio_lat_p1 = separate_av_latent(sample_out_1, output_index=0)
         del sample_out_1
         mem.soft_cleanup()
 
-        # ── 9. LTXDirectorCropGuides (workflow node 55) ───────────────────────
-        pos_cropped, neg_cropped, video_lat_cropped = run_director_crop_guides(
-            pos_cond, neg_cond, video_lat_p1
+        # -- 11. LTXDirectorCropGuides (workflow node 55) --
+        # Takes Guide133's pos/neg outputs + separated video from pass1
+        pos_crop55, neg_crop55, lat_crop55 = run_director_crop_guides(
+            pos_cond=pos_g1,
+            neg_cond=neg_g1,
+            latent=video_lat_p1,
         )
-        del video_lat_p1
+        del video_lat_p1, pos_g1, neg_g1, model_g1
         mem.soft_cleanup()
 
-        # ── 10. 2× latent spatial upscale (workflow node 14) ──────────────────
-        upscaled_lat = upsample_video_latent(video_lat_cropped, upscaler, video_vae)
-        del video_lat_cropped, upscaler
+        # -- 12. 2x latent spatial upscale (workflow node 14) --
+        # Takes CropGuides55's latent output (slot 2)
+        upscaled_lat = upsample_video_latent(lat_crop55, upscaler, video_vae)
+        del lat_crop55, upscaler
         mem.cleanup()
 
-        # ── 11. Re-condition image on upscaled latent + concat audio ──────────
-        av_latent_pass2 = recondition_image_on_upscaled(
-            upscaled_lat, preprocessed, image_strength, image_bypass,
-            video_vae, audio_lat_p1,
-        )
-        del upscaled_lat, audio_lat_p1, preprocessed
-        mem.soft_cleanup()
-
-        # ── 12. LTXDirectorGuide pass 2 (workflow node 132: upscale_factor=1) ─
+        # -- 13. LTXDirectorGuide pass 2 (workflow node 132: upscale_factor=1.0) --
+        # Takes: CropGuides55's pos/neg, VAE, upsampled latent,
+        #        LTXDirector's guide_data, motion_guide_data, base model
         pos_g2, neg_g2, lat_g2, model_g2 = run_director_guide(
-            pos_cond=pos_cropped,
-            neg_cond=neg_cropped,
+            pos_cond=pos_crop55,
+            neg_cond=neg_crop55,
             video_vae=video_vae,
-            latent=get_value_at_index(av_latent_pass2, 0),
-            guide_data=None,
-            motion_guide_data=None,
-            model=model_g1 if model_g1 is not dit_model else dit_model,
+            latent=upscaled_lat,
+            guide_data=dir_guide_data,
+            motion_guide_data=dir_motion_guide_data,
+            model=base_model,
             upscale_factor=1.0,
-            node_id="pass2",
+            node_id="pass2 (node 132)",
         )
-        del pos_cropped, neg_cropped, av_latent_pass2
+        del pos_crop55, neg_crop55, upscaled_lat
         mem.cleanup()
         mem.warn_if_low()
 
-        # ── 13. Sampling pass 2 ───────────────────────────────────────────────
+        # -- 14. LTXVConcatAVLatent (workflow node 18) --
+        # Concatenates Guide132's latent(2) + pass1 separated audio_latent(1)
+        ltxvconcatavlatent2 = get_node("LTXVConcatAVLatent")
+        av_concat_pass2 = ltxvconcatavlatent2.EXECUTE_NORMALIZED(
+            video_latent=lat_g2,
+            audio_latent=audio_lat_p1,
+        )
+        latent_for_sampler2 = get_value_at_index(av_concat_pass2, 0)
+        del av_concat_pass2, audio_lat_p1, lat_g2
+        mem.soft_cleanup()
+
+        # -- 15. Sampling pass 2 (workflow node 19: 4 steps, denoise=0.42) --
+        # CFGGuider (node 17) uses Guide132's model/pos/neg outputs
         sample_out_2 = run_sampling_pass(
             model=model_g2,
             pos_cond=pos_g2,
             neg_cond=neg_g2,
-            latent=lat_g2,
+            latent=latent_for_sampler2,
             noise_seed=0,          # workflow node 30: seed=0 for refinement pass
-            steps=WORKFLOW_STEPS,
+            steps=WORKFLOW_STEPS_PASS2,
             cfg=WORKFLOW_CFG,
+            denoise=WORKFLOW_DENOISE_PASS2,
             pass_name=f"Pass2 (chunk {idx})",
         )
 
-        del pos_g2, neg_g2, lat_g2, model_g2, dit_model
+        del latent_for_sampler2, model_g2, dit_model
         mem.cleanup()
 
-        # ── 14. Separate final AV latent (workflow node 22) ───────────────────
-        # Note: reference uses index 1 (denoised_output) for pass 2 output
-        final_video_lat, final_audio_lat = separate_av_latent(sample_out_2)
+        # -- 16. Separate final AV latent (workflow node 22) --
+        # Pass 2 uses output index 1 (denoised_output)
+        final_video_lat, final_audio_lat = separate_av_latent(sample_out_2, output_index=1)
         del sample_out_2
         mem.soft_cleanup()
 
-        # ── 15. Decode video (CPU transfer happens inside) ────────────────────
-        frames_cpu = decode_video_latent(final_video_lat, video_vae)
-        del final_video_lat
+        # -- 17. LTXDirectorCropGuides (workflow node 54) --
+        # Takes Guide132's pos/neg + pass2 separated video_latent
+        # Output latent (slot 2) goes to VAEDecode
+        pos_crop54, neg_crop54, lat_crop54 = run_director_crop_guides(
+            pos_cond=pos_g2,
+            neg_cond=neg_g2,
+            latent=final_video_lat,
+        )
+        del pos_g2, neg_g2, final_video_lat, pos_crop54, neg_crop54
+        mem.soft_cleanup()
 
-        # ── 16. Decode audio ──────────────────────────────────────────────────
+        # -- 18. Decode video (workflow node 1: VAEDecode) --
+        # Uses CropGuides54's latent output (slot 2)
+        frames_cpu = decode_video_latent(lat_crop54, video_vae)
+        del lat_crop54
+
+        # -- 19. Decode audio (workflow node 24: LTXVAudioVAEDecode) --
         audio_cpu = decode_audio_latent(final_audio_lat, audio_vae)
         del final_audio_lat
 
-        # ── 17. Unload VAEs ───────────────────────────────────────────────────
+        # -- 20. Unload VAEs --
         del video_vae, audio_vae
         mem.cleanup()
 
-    # ── 18. Save chunk to disk ───────────────────────────────────────────────
+    # -- 21. Save chunk to disk --
     chunk_path = save_chunk_to_disk(
         frames_cpu, audio_cpu, idx, fps, width, height
     )

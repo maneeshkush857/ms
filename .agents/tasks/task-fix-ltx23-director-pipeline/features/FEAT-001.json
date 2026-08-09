@@ -1,0 +1,36 @@
+{
+  "id": "FEAT-001",
+  "type": "fix",
+  "description": "Fix all critical bugs in the LTX23 Director 2.0 MV pipeline by correcting the two-pass sampling parameters, pipeline execution order, LTXDirectorGuide integration, LTXDirector node invocation, and separate_av_latent indexing to match the ComfyUI workflow JSON exactly.",
+  "status": "in_progress",
+  "steps": [
+    "STEP 1 - Fix Pass 2 sampling parameters (Section 15, run_sampling_pass function): The workflow JSON node 21 (BasicScheduler for pass 2) uses steps=4 and denoise=0.42, but the script hardcodes WORKFLOW_STEPS=8 and denoise=1.0 for both passes. Add separate constants WORKFLOW_STEPS_PASS2=4 and WORKFLOW_DENOISE_PASS2=0.42. Update run_sampling_pass() to accept a denoise parameter (default 1.0). Update the pass 2 call in generate_chunk() to pass steps=4 and denoise=0.42.",
+    "STEP 2 - Fix separate_av_latent index for Pass 2 (Section 18, generate_chunk function): The reference experiment_ltx23.py uses get_value_at_index(samplercustomadvanced_119, 1) for pass 2 output (index 1 = denoised_output). The current script uses index 0 for both passes. Fix the pass 2 separate_av_latent call to use index 1 from the sampler output. SamplerCustomAdvanced returns (output, denoised_output) - pass 1 uses output[0], pass 2 refinement uses output[1].",
+    "STEP 3 - Fix pipeline execution order in generate_chunk (Section 18): The correct workflow order is: (A) For pass 1: LTXDirectorGuide(133) takes the LTXDirector video_latent output directly as its latent input, produces (pos, neg, latent, model). Then LTXVConcatAVLatent(29) concatenates the guide's latent output with LTXDirector's audio_latent. Then CFGGuider uses the guide's model/pos/neg outputs. Then SamplerCustomAdvanced runs. (B) For pass 2: LTXVSeparateAVLatent(34) splits pass1 output. LTXDirectorCropGuides(55) crops the conditioning from pass1's guide outputs using the separated video_latent. LTXVLatentUpsampler(14) upsamples CropGuides' latent output. LTXDirectorGuide(132) takes upsampled latent + CropGuides' pos/neg, produces (pos, neg, latent, model). LTXVConcatAVLatent(18) concatenates guide's latent output with pass1's separated audio_latent. CFGGuider uses guide's model/pos/neg. SamplerCustomAdvanced runs pass 2. Rewrite generate_chunk() to follow this exact order.",
+    "STEP 4 - Fix LTXDirectorGuide integration (Section 14, run_director_guide function): The function currently passes wrong kwargs. Based on the workflow widget values, LTXDirectorGuide takes: positive, negative, vae, latent, guide_data, motion_guide_data, model as inputs. The widget values for node 133 (pass1) are: [retake_image='None', upscale_factor_pass=1, upscale_factor=0.5, interpolation='bicubic', blend_radius=1, crop_method='center', use_tiling=True, tile_overlap=False, tile_size=256, tile_stride=64, force_inpaint=False]. For node 132 (pass2): same but upscale_factor=1.0. Fix the function to pass these correctly and to USE the returned model and conditioning outputs (slots 0=positive, 1=negative, 2=latent, 3=model) which feed into CFGGuider.",
+    "STEP 5 - Fix LTXDirectorCropGuides usage (Section 14 and 18): The workflow has TWO crop guide nodes with DIFFERENT purposes: Node 55 runs after pass 1 separation (takes pass1 guide's pos/neg outputs + separated video_latent from pass1), feeds upsampler. Node 54 runs after pass 2 separation (takes pass2 guide's pos/neg outputs + separated video_latent from pass2), feeds final VAEDecode. Update the pipeline to correctly route the crop guide outputs. Node 55's latent output (slot 2) goes to LTXVLatentUpsampler. Node 54's latent output (slot 2) goes to VAEDecode.",
+    "STEP 6 - Fix LTXDirector node invocation (Section 14, build_director_conditioning): The LTXDirector node (131) outputs 8 things: model(0), positive(1), video_latent(2), audio_latent(3), guide_data(4), motion_guide_data(5), frame_rate(6), combined_audio(7). The positive output feeds into ConditioningZeroOut(128) then both feed into LTXVConditioning(27). The video_latent output replaces EmptyLTXVLatentVideo entirely - it goes directly to LTXDirectorGuide(133). The function should return all these outputs properly. Remove the broken try/except with wrong positional args. Since the LTXDirector node has complex widget values (JSON timeline data), use EXECUTE_NORMALIZED with the correct parameter names from the workflow.",
+    "STEP 7 - Fix generate_chunk to NOT build empty latents when LTXDirector provides them: When LTXDirector is available and returns a video_latent + audio_latent, the pipeline should NOT call build_empty_latents(). The LTXDirector node replaces: EmptyLTXVLatentVideo, LTXVImgToVideoInplace, and LTXVEmptyLatentAudio. Update generate_chunk() with a conditional: if LTXDirector is available, use its outputs; otherwise fall back to the existing build_empty_latents path.",
+    "STEP 8 - Add WORKFLOW_STEPS_PASS2 and WORKFLOW_DENOISE_PASS2 constants near line ~365 where other workflow constants are defined: Add WORKFLOW_STEPS_PASS2 = 4 and WORKFLOW_DENOISE_PASS2 = 0.42 alongside the existing WORKFLOW_STEPS, WORKFLOW_CFG constants.",
+    "STEP 9 - Fix the final decode path: After pass 2 separation, the workflow runs LTXDirectorCropGuides(54) on the separated video_latent, and the CropGuides' latent output (slot 2) feeds into VAEDecode. The audio_latent from pass 2 separation feeds into LTXVAudioVAEDecode. Update decode_video_latent call to use the crop guides' latent output, not the raw separated video latent."
+  ],
+  "acceptance_criteria": [
+    "Python file passes py_compile and ast.parse without errors",
+    "Pass 2 sampling uses steps=4 and denoise=0.42 (matching workflow node 21)",
+    "Pass 2 separate_av_latent uses index 1 from sampler output (denoised_output)",
+    "Pipeline order matches workflow: Guide -> Concat -> CFG -> Sample (for both passes)",
+    "LTXDirectorGuide outputs (model, pos, neg) are used by CFGGuider, not the original conditioning",
+    "LTXDirectorCropGuides node 55 processes pass1 separated output, node 54 processes pass2 separated output",
+    "When LTXDirector is available, its video_latent and audio_latent are used instead of empty latents",
+    "WORKFLOW_STEPS_PASS2=4 and WORKFLOW_DENOISE_PASS2=0.42 constants exist"
+  ],
+  "verification": [
+    "python3 -c \"import py_compile; py_compile.compile('/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py', doraise=True); print('PASS: py_compile OK')\"",
+    "python3 -c \"import ast; ast.parse(open('/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py').read()); print('PASS: AST parse OK')\"",
+    "grep -n 'WORKFLOW_STEPS_PASS2' '/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py'",
+    "grep -n 'WORKFLOW_DENOISE_PASS2' '/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py'",
+    "grep -n 'denoise=0.42\\|denoise=WORKFLOW_DENOISE_PASS2' '/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py'"
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}
