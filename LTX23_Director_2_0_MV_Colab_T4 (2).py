@@ -313,9 +313,10 @@ T4_PROFILES = {
         "generation_width": 832,
         "generation_height": 480,
         "offload_models": True,
+        "skip_director": True,   # Skip LTXDirector (avoids loading CLIP/Gemma 3 12B ~6GB)
         "img_compression": 33,
         "longer_edge": 848,
-        "description": "Conservative: 48-frame chunks, 832×480 generation, strong offloading",
+        "description": "Conservative: 48-frame chunks, 832×480 generation, strong offloading, no CLIP",
     },
     "t4_balanced": {
         "chunk_frames": 73,
@@ -1597,6 +1598,19 @@ def build_director_conditioning(
     """
     from nodes import NODE_CLASS_MAPPINGS
 
+    # -- T4 memory guard: skip LTXDirector entirely in t4_safe mode --
+    # LTXDirector requires loading CLIP (Gemma 3 12B ~6GB) alongside the DiT model.
+    # On T4 (15GB VRAM, ~12.7GB RAM), after DiT + 4 LoRAs load (~14.15GB GPU),
+    # there is physically no room for CLIP. Skip Director and use fallback path
+    # which only needs DiT (already loaded/cached) + audio_vae (small, ~0.5GB).
+    active_profile = T4_PROFILES.get(QUALITY_MODE, {})
+    if active_profile.get("skip_director", False):
+        print("  Skipping LTXDirector (t4_safe mode) -- CLIP would exceed RAM.")
+        print("  Using fallback conditioning (no CLIP needed).")
+        return _build_director_fallback(pos_cond, neg_cond, num_frames, fps,
+                                        dit_model=dit_model, audio_vae=audio_vae,
+                                        reason="t4_safe mode - CLIP skipped")
+
     # -- LTXDirector path (WhatDreamsCost) --
     if "LTXDirector" in NODE_CLASS_MAPPINGS:
         print("  Using LTXDirector (WhatDreamsCost) node...")
@@ -1737,7 +1751,8 @@ def build_director_conditioning(
         except (TypeError, AttributeError) as e:
             print(f"  LTXDirector call failed ({e}) -- using fallback conditioning.")
             return _build_director_fallback(pos_cond, neg_cond, num_frames, fps,
-                                           dit_model=dit_model, audio_vae=audio_vae)
+                                           dit_model=dit_model, audio_vae=audio_vae,
+                                           reason=f"call failed: {e}")
 
         # Extract all outputs per workflow node 131 output slots
         dir_model       = get_value_at_index(director_out, 0)
@@ -1757,16 +1772,20 @@ def build_director_conditioning(
 
 
 def _build_director_fallback(pos_cond, neg_cond, num_frames: int, fps: int,
-                             dit_model=None, audio_vae=None) -> Tuple:
+                             dit_model=None, audio_vae=None,
+                             reason: str = "not found") -> Tuple:
     """
-    Fallback when LTXDirector is not available.
+    Fallback when LTXDirector is not available or intentionally skipped.
     Returns the same tuple shape as build_director_conditioning but with
     None for guide_data, motion_guide_data, and generates empty audio latent.
 
     Accepts optional dit_model and audio_vae to avoid redundant loads when
     the caller (e.g. generate_chunk) has already loaded these models.
+
+    Args:
+        reason: Why fallback is used (e.g. "not found", "t4_safe mode skip").
     """
-    print("  LTXDirector node not found -- using standard conditioning fallback.")
+    print(f"  LTXDirector fallback ({reason}) -- using standard conditioning.")
     if dit_model is None:
         dit_model = load_dit_model(apply_loras=True)
     else:
@@ -2447,9 +2466,22 @@ def generate_chunk(
             loaded_image_tuple, width, height, img_compress, longer_edge
         )
 
-        # -- 2. Load VAEs --
-        video_vae = load_video_vae()
-        audio_vae = load_audio_vae()
+        # -- 2. Load VAEs (deferred for t4_safe to reduce peak memory) --
+        # In t4_safe mode, we defer video_vae loading until step 7 (Director Guide)
+        # since it is not needed earlier. audio_vae is still needed for the fallback
+        # path in build_director_conditioning (step 4: LTXVEmptyLatentAudio).
+        # In non-t4_safe modes, load both upfront for the Director path that may
+        # need them earlier.
+        active_profile = T4_PROFILES.get(QUALITY_MODE, {})
+        if active_profile.get("skip_director", False):
+            # T4-safe: load only audio_vae now, defer video_vae
+            print("  [t4_safe] Deferring video VAE load (saving ~1GB during DiT load)")
+            video_vae = None  # Will be loaded before Director Guide (step 7)
+            audio_vae = load_audio_vae()
+        else:
+            # Non-t4-safe: load both for LTXDirector path
+            video_vae = load_video_vae()
+            audio_vae = load_audio_vae()
 
         # -- 3. Load upscaler (DEFERRED until after pass 1 to reduce VRAM pressure) --
         # The upscaler is only needed for step 12 (between pass 1 and pass 2).
@@ -2493,6 +2525,9 @@ def generate_chunk(
             # NOTE: build_empty_latents already fuses video+audio via LTXVConcatAVLatent
             # internally, so the returned av_latent is already an AV-fused latent.
             # We must NOT concat additional audio at step 8 (that would double-concat).
+            # Ensure video_vae is loaded (may have been deferred in t4_safe mode)
+            if video_vae is None:
+                video_vae = load_video_vae()
             av_latent_pass1, img_conditioned_lat = build_empty_latents(
                 num_frames, latent_w, latent_h, fps,
                 preprocessed, image_strength, image_bypass,
@@ -2527,6 +2562,9 @@ def generate_chunk(
         # -- 7. LTXDirectorGuide pass 1 (workflow node 133: upscale_factor=0.5) --
         # Takes: pos/neg conditioning, VAE, video_latent from LTXDirector,
         #        guide_data, motion_guide_data, base model
+        # Load video_vae now if deferred (t4_safe mode defers to reduce peak memory)
+        if video_vae is None:
+            video_vae = load_video_vae()
         pos_g1, neg_g1, lat_g1, model_g1 = run_director_guide(
             pos_cond=cond_pos_for_guide,
             neg_cond=cond_neg_for_guide,
