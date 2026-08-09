@@ -1,0 +1,25 @@
+{
+  "id": "FEAT-004",
+  "type": "fix",
+  "description": "Fix EXECUTE_NORMALIZED AttributeError for WhatDreamsCost custom nodes (LTXDirector, LTXDirectorGuide, LTXDirectorCropGuides) by using the standard ComfyUI FUNCTION class attribute pattern.",
+  "status": "completed",
+  "steps": [
+    "STEP 1 - Fix build_director_conditioning: Replace EXECUTE_NORMALIZED call with FUNCTION-based dispatch for LTXDirector node. Read node_cls.FUNCTION attribute to get the actual method name, call that via getattr.",
+    "STEP 2 - Fix run_director_guide: Replace EXECUTE_NORMALIZED/execute fallback pattern with FUNCTION-based dispatch for LTXDirectorGuide node.",
+    "STEP 3 - Fix run_director_crop_guides: Replace EXECUTE_NORMALIZED/execute fallback pattern with FUNCTION-based dispatch for LTXDirectorCropGuides node.",
+    "STEP 4 - Keep LTXVCropGuides (core node) using EXECUTE_NORMALIZED as-is since it is a core ComfyUI node that supports that method."
+  ],
+  "acceptance_criteria": [
+    "Python file passes py_compile and ast.parse without errors",
+    "All three WhatDreamsCost node calls use getattr(cls, 'FUNCTION') pattern",
+    "Graceful fallback to EXECUTE_NORMALIZED if FUNCTION attribute is not defined",
+    "Error handling catches both TypeError and AttributeError",
+    "LTXVCropGuides fallback (core node) still uses EXECUTE_NORMALIZED"
+  ],
+  "verification": [
+    "python3 -c \"import py_compile; py_compile.compile('/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py', doraise=True); print('PASS')\"",
+    "python3 -c \"import ast; ast.parse(open('/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py').read()); print('PASS')\""
+  ],
+  "blocked_reason": null,
+  "findings": "Fixed the root cause of the AttributeError. WhatDreamsCost custom nodes do not implement EXECUTE_NORMALIZED (which is a ComfyUI core method). Instead, they follow the standard ComfyUI pattern where the node class defines FUNCTION = 'method_name' as a class attribute. The fix reads this attribute and calls the correct method via getattr. Falls back to EXECUTE_NORMALIZED only for core nodes that lack the FUNCTION attribute."
+}
