@@ -859,11 +859,112 @@ def _install_custom_nodes():
 
 _NODES_LOADED = False
 
+def _neutralize_comfy_kitchen():
+    """
+    Inject a harmless comfy_kitchen stub into sys.modules BEFORE any
+    ComfyUI module is imported.
+
+    WHY THIS IS NEEDED
+    ──────────────────
+    Google Colab T4 runtimes (as of Aug 2026) have `comfy_kitchen`
+    pre-installed system-wide via pip.  When ComfyUI's `comfy/quant_ops.py`
+    runs `import comfy_kitchen`, it triggers:
+
+        comfy_kitchen → torch._dynamo → torch._dynamo.config →
+        Config(deprecated=True, ...)  ← TypeError on PyTorch 2.11
+
+    This crash occurs regardless of which ComfyUI fork is installed because
+    `comfy_kitchen` lives in the system site-packages, not inside ComfyUI.
+    The ONLY reliable fix is to shadow the broken package before it is
+    imported.
+
+    HOW THE STUB WORKS
+    ──────────────────
+    `comfy/quant_ops.py` (both Isi-dev fork and upstream) tries to import:
+
+        import comfy_kitchen as ck
+        from comfy_kitchen.tensor import (
+            QuantizedTensor, QUANT_ALGOS, QUANT_ALGO_DEFAULT,
+            QuantizedLinear, QuantizedConv2d,
+        )
+
+    If the import succeeds, ComfyUI uses comfy_kitchen for quantized ops.
+    If it fails (ImportError), ComfyUI falls back to pure-PyTorch ops.
+
+    We pre-populate sys.modules with a fake package that raises ImportError
+    on attribute access, triggering the clean fallback path inside quant_ops.
+    """
+    if "comfy_kitchen" in sys.modules:
+        existing = sys.modules["comfy_kitchen"]
+        # Already a stub we installed? Nothing to do.
+        if getattr(existing, "_is_ltx23_stub", False):
+            return
+        # Real comfy_kitchen is present — try importing it to see if it works.
+        try:
+            import torch._dynamo  # noqa: F401
+            # If we get here on PyTorch 2.11, comfy_kitchen is probably safe.
+            return
+        except TypeError:
+            # comfy_kitchen triggers the Config(deprecated=) bug — replace it.
+            pass
+
+    # Build a recursive stub module that raises ImportError for all attribute access.
+    # This causes quant_ops.py to fall through to its `except ImportError` branch
+    # and use pure-PyTorch quantization instead.
+    import types
+
+    class _ComfyKitchenStub(types.ModuleType):
+        """Stub that causes ComfyUI to fall back to pure-PyTorch quantization."""
+        _is_ltx23_stub = True
+
+        def __getattr__(self, name: str):
+            # Raising ImportError triggers ComfyUI's try/except ImportError fallback
+            raise ImportError(
+                f"comfy_kitchen.{name} is not available "
+                f"(comfy_kitchen neutralized for PyTorch 2.11 compatibility)"
+            )
+
+        def __repr__(self):
+            return "<comfy_kitchen stub — PyTorch 2.11 compatibility shim>"
+
+    # Register the stub for comfy_kitchen and all its sub-packages that
+    # quant_ops.py might try to import
+    stub_names = [
+        "comfy_kitchen",
+        "comfy_kitchen.tensor",
+        "comfy_kitchen.backends",
+        "comfy_kitchen.backends.cuda",
+        "comfy_kitchen.backends.eager",
+        "comfy_kitchen.backends.eager.quantization",
+        "comfy_kitchen.registry",
+        "comfy_kitchen.scaled_mm_v2",
+    ]
+    for mod_name in stub_names:
+        stub = _ComfyKitchenStub(mod_name)
+        stub.__package__ = "comfy_kitchen"
+        stub.__path__ = []
+        sys.modules[mod_name] = stub
+
+    print("  ✓ comfy_kitchen neutralized (pure-PyTorch quantization fallback active).")
+
+
 def setup_comfyui():
-    """Add ComfyUI to sys.path and initialise node class mappings."""
+    """
+    Add ComfyUI to sys.path and neutralize comfy_kitchen BEFORE any
+    ComfyUI module is imported.
+
+    Call order is critical:
+        1. sys.path.insert  — ComfyUI modules become importable
+        2. _neutralize_comfy_kitchen()  — stub installed BEFORE first import
+        3. (caller) import_custom_nodes()  — ComfyUI nodes load without crash
+    """
     comfyui_dir = CONFIG["comfyui_dir"]
     if comfyui_dir not in sys.path:
         sys.path.insert(0, comfyui_dir)
+
+    # MUST be called before any `from nodes import ...`
+    _neutralize_comfy_kitchen()
+
     print(f"  ComfyUI path: {comfyui_dir}")
 
 def _init_prompt_server():
