@@ -1,0 +1,14 @@
+{
+  "task_id": "task-fix-t4-ram-crash-clip",
+  "task_description": "Fix Colab T4 RAM crash caused by LTXDirector loading CLIP (Gemma 3 12B ~6GB) when DiT+4LoRAs already fill GPU/RAM. Skip LTXDirector entirely in t4_safe mode to avoid CLIP loading. Defer VAE loading where possible to reduce peak memory.",
+  "status": "completed",
+  "feature_order": ["FEAT-001"],
+  "blocked_reason": null,
+  "verification": {
+    "build": "pass",
+    "tests": "pass",
+    "test_quality": "skipped",
+    "docker_build": "skipped",
+    "summary": "py_compile and ast.parse both pass. No test suite exists for this Colab pipeline. Code review confirms correct memory flow: CLIP load eliminated in t4_safe mode, video_vae deferred, DiT loads without competing for RAM."
+  }
+}

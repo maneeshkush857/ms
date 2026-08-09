@@ -1,0 +1,25 @@
+{
+  "id": "FEAT-001",
+  "type": "fix",
+  "description": "Fix T4 RAM crash by skipping LTXDirector (and its CLIP loading) in t4_safe mode, deferring VAE loading until needed, and ensuring sequential model loading pattern.",
+  "status": "completed",
+  "steps": [
+    "Step 1 - In build_director_conditioning, add early return to fallback when QUALITY_MODE == 't4_safe' to skip CLIP loading entirely",
+    "Step 2 - In generate_chunk, defer video_vae and audio_vae loading from step 2 (before director conditioning) to step 6 (before Director Guide pass 1) since they are not needed until then in the fallback path",
+    "Step 3 - In _build_director_fallback, accept video_vae as optional parameter so it can be loaded externally and passed in (avoiding double load)",
+    "Step 4 - Add a T4_PROFILES skip_director flag and use it to control Director skip behavior"
+  ],
+  "acceptance_criteria": [
+    "Python file passes py_compile and ast.parse without errors",
+    "When QUALITY_MODE is t4_safe, build_director_conditioning skips CLIP loading and goes straight to fallback",
+    "Video VAE is loaded only when needed (before Director Guide, not at the top of generate_chunk)",
+    "Audio VAE loading is deferred until build_director_conditioning fallback or decode time",
+    "The pipeline still works correctly when not in t4_safe mode"
+  ],
+  "verification": [
+    "python3 -c \"import py_compile; py_compile.compile('/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py', doraise=True); print('PASS')\"",
+    "python3 -c \"import ast; ast.parse(open('/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py').read()); print('PASS')\""
+  ],
+  "blocked_reason": null,
+  "findings": "Implemented successfully. In t4_safe mode: (1) LTXDirector is bypassed entirely via skip_director profile flag, preventing CLIP (Gemma 3 12B ~6GB) from loading alongside DiT+LoRAs. (2) Video VAE loading deferred from step 2 to step 6/7 (when actually needed), reducing peak memory by ~1GB during the critical DiT+LoRA load phase. (3) Fallback path still loads DiT+4LoRAs and audio_vae (small), producing standard conditioning. The pipeline retains full Director functionality when not in t4_safe mode."
+}

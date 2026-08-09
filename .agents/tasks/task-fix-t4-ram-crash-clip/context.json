@@ -1,0 +1,11 @@
+{
+  "project_type": "Google Colab single-file Python pipeline for LTX-2.3 Director 2.0 video generation",
+  "language": "Python",
+  "build_system": "None - single .py file run in Google Colab (no build step)",
+  "test_framework": "None - manual runtime testing on Colab T4",
+  "build_command": "python3 -c \"import py_compile; py_compile.compile('/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py', doraise=True); print('PASS')\"",
+  "test_command": "python3 -c \"import ast; ast.parse(open('/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py').read()); print('AST parse OK')\"",
+  "verification_instructions": "1. Parse the Python file with ast.parse to confirm no syntax errors. 2. Verify logical flow by reading the code.",
+  "setup_instructions": "No setup needed - this is a single Python file",
+  "relevant_files": ["LTX23_Director_2_0_MV_Colab_T4 (2).py"]
+}
