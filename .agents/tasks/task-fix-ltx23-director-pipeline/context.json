@@ -1,0 +1,21 @@
+{
+  "project_type": "Google Colab notebook (Python script) implementing LTX-2.3 Director 2.0 MV pipeline",
+  "language": "Python",
+  "build_system": "None (Colab notebook, no build system). Static analysis only.",
+  "test_framework": "None. Verification through Python syntax check and static analysis.",
+  "build_command": "python3 -c \"import py_compile; py_compile.compile('/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py', doraise=True)\"",
+  "test_command": "python3 -c \"import ast; ast.parse(open('/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py').read()); print('AST parse OK')\"",
+  "verification_instructions": "1. Run Python syntax validation (py_compile). 2. Run AST parse. 3. Grep for critical workflow constants to verify fixes.",
+  "snapshot_or_generated_files": null,
+  "setup_instructions": "No setup needed. File is a standalone Python script.",
+  "environment_constraints": "This script is designed to run on Google Colab T4 GPUs with ComfyUI installed. We cannot run it here. Verification is limited to syntax/AST checks and comparing against the workflow JSON.",
+  "contribution_requirements": "The script must faithfully implement the ComfyUI workflow defined in LTX-2.3_Director_2.0-MV-Workflow-30s.json",
+  "key_patterns": "ComfyUI nodes are called via NODE_CLASS_MAPPINGS[name]() to get instance, then .EXECUTE_NORMALIZED() or specific methods. get_value_at_index() extracts tuple outputs. Reference scripts (experiment_ltx23.py) show working patterns for the two-pass pipeline.",
+  "relevant_files": [
+    "LTX23_Director_2_0_MV_Colab_T4 (2).py",
+    "experiment_ltx23.py",
+    "ltx2_ti2v_distilled.py",
+    "LTX-2.3_Director_2.0-MV-Workflow-30s.json"
+  ],
+  "directory_structure": "/projects/sandbox/ms/ contains the main script, two reference scripts, and the ComfyUI workflow JSON"
+}

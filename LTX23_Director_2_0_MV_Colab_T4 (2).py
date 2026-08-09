@@ -1537,8 +1537,26 @@ def build_director_conditioning(
 
         # Load models needed by Director
         dit_model = load_dit_model(apply_loras=True)
-        clip_model = None  # CLIP loaded separately via DualCLIPLoader
         audio_vae = load_audio_vae()
+
+        # Load CLIP via DualCLIPLoader (same as build_text_conditioning, workflow node 12)
+        dualcliploader = get_node("DualCLIPLoader")
+        try:
+            clip_result = dualcliploader.load_clip(
+                clip_name1=MODELS["text_encoder_1"],
+                clip_name2=MODELS["text_encoder_2"],
+                type="ltxv",
+                device="default",
+            )
+        except Exception as e:
+            print(f"  Primary CLIP load failed ({e}), trying fp8 fallback...")
+            clip_result = dualcliploader.load_clip(
+                clip_name1="gemma_3_12B_it_fp8_scaled.safetensors",
+                clip_name2="ltx-2.3-22b-dev_embeddings_connectors.safetensors",
+                type="ltxv",
+                device="default",
+            )
+        clip_model = get_value_at_index(clip_result, 0)
 
         director = NODE_CLASS_MAPPINGS["LTXDirector"]()
 
@@ -2186,7 +2204,7 @@ def generate_chunk(
                 video_vae, audio_vae,
             )
             video_latent_pass1 = get_value_at_index(av_latent_pass1, 0)
-            audio_latent_for_concat = None  # Will be inside the AV concat already
+            audio_latent_for_concat = dir_audio_latent  # Fallback still has valid audio from _build_director_fallback
             del av_latent_pass1
             mem.soft_cleanup()
 
@@ -2306,8 +2324,8 @@ def generate_chunk(
         mem.cleanup()
 
         # -- 16. Separate final AV latent (workflow node 22) --
-        # Pass 2 uses output index 1 (denoised_output)
-        final_video_lat, final_audio_lat = separate_av_latent(sample_out_2, output_index=1)
+        # Pass 2 uses output index 0 (output) - workflow wires slot 0 to node 22
+        final_video_lat, final_audio_lat = separate_av_latent(sample_out_2, output_index=0)
         del sample_out_2
         mem.soft_cleanup()
 

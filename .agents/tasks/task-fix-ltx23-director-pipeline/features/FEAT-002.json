@@ -1,0 +1,23 @@
+{
+  "id": "FEAT-002",
+  "type": "fix",
+  "description": "Address review feedback (iteration 1): Fix pass 2 separate_av_latent output index, fix fallback path audio concat, and load CLIP for LTXDirector.",
+  "status": "in_progress",
+  "steps": [
+    "STEP 1 - Fix pass 2 separate_av_latent to use output_index=0 instead of output_index=1 (the workflow JSON wires slot 0 from SamplerCustomAdvanced to LTXVSeparateAVLatent for both passes).",
+    "STEP 2 - Fix fallback path in generate_chunk: when dir_video_latent is None but dir_audio_latent is valid, set audio_latent_for_concat = dir_audio_latent instead of None.",
+    "STEP 3 - Load CLIP via DualCLIPLoader in build_director_conditioning and pass it to director_kwargs, following the same pattern as build_text_conditioning."
+  ],
+  "acceptance_criteria": [
+    "Python file passes py_compile and ast.parse without errors",
+    "Pass 2 separate_av_latent uses output_index=0",
+    "Fallback path sets audio_latent_for_concat = dir_audio_latent when dir_video_latent is None",
+    "DualCLIPLoader is called in build_director_conditioning and result passed to director_kwargs as clip"
+  ],
+  "verification": [
+    "python3 -c \"import py_compile; py_compile.compile('/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py', doraise=True); print('PASS')\"",
+    "python3 -c \"import ast; ast.parse(open('/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py').read()); print('AST parse OK')\""
+  ],
+  "blocked_reason": null,
+  "findings": null
+}
