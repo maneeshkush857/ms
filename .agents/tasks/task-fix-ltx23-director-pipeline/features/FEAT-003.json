@@ -2,7 +2,7 @@
   "id": "FEAT-003",
   "type": "fix",
   "description": "Address v2 review feedback (iteration 2): Fix fallback double-concat audio, wire dir_positive into Guide pass 1, update stale docstrings, and add clarifying CLIP comment.",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "STEP 1 - Fix fallback double-concat audio: In generate_chunk(), when dir_video_latent is None (fallback path), set audio_latent_for_concat = None instead of dir_audio_latent, since build_empty_latents already fuses video+audio internally.",
     "STEP 2 - Wire dir_positive into pipeline: When dir_positive is not None (Director path), run ConditioningZeroOut + LTXVConditioning on dir_positive to produce timeline-aware pos/neg conditioning, and feed THAT to run_director_guide() for pass 1 instead of plain pos_cond/neg_cond.",
@@ -21,5 +21,5 @@
     "python3 -c \"import ast; ast.parse(open('/projects/sandbox/ms/LTX23_Director_2_0_MV_Colab_T4 (2).py').read()); print('PASS')\""
   ],
   "blocked_reason": null,
-  "findings": null
+  "findings": "All 4 review issues addressed: (1) Fallback path now sets audio_latent_for_concat=None since build_empty_latents already fuses AV internally, preventing double-concat; (2) dir_positive is now routed through ConditioningZeroOut + LTXVConditioning to produce timeline-aware pos/neg conditioning that feeds Guide pass 1, matching the workflow signal path (nodes 128+27); (3) Both docstrings updated to correctly document output_index=0 for both passes; (4) Added comment explaining CLIP stays unmodified because all LoRAs are model-only. Issue 5 (output_index=0 vs 1) required no code change as the code already correctly follows the workflow JSON."
 }
