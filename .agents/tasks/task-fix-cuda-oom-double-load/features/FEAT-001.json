@@ -1,0 +1,24 @@
+{
+  "id": "FEAT-001",
+  "type": "fix",
+  "description": "Fix CUDA OOM from DiT double-load, add model cache, fix custom node import failures (PromptServer mock, kornia compat), and update generate_chunk to avoid redundant model loads.",
+  "status": "in_progress",
+  "steps": [
+    "Add _DIT_MODEL_CACHE global and cache logic to load_dit_model()",
+    "Add release_dit_model() function to clear cache and free memory",
+    "Modify _build_director_fallback() to accept optional dit_model and audio_vae parameters",
+    "Remove the DiT load from generate_chunk step 3 (let build_director_conditioning handle it)",
+    "Add PromptServer mock before import_custom_nodes() runs",
+    "Add kornia compatibility fix before import_custom_nodes() runs"
+  ],
+  "acceptance_criteria": [
+    "File parses without syntax errors (ast.parse succeeds)",
+    "load_dit_model() has a cache that prevents loading the model twice",
+    "release_dit_model() exists and clears the cache",
+    "_build_director_fallback() accepts optional dit_model/audio_vae params and reuses them",
+    "generate_chunk() does NOT call load_dit_model() directly before build_director_conditioning()",
+    "PromptServer mock is applied before import_custom_nodes()",
+    "kornia compatibility fix is applied before import_custom_nodes()"
+  ],
+  "blocked_reason": null
+}

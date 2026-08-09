@@ -713,6 +713,29 @@ def import_custom_nodes():
     import nest_asyncio
     nest_asyncio.apply()
 
+    # ── Fix: Mock PromptServer.instance for headless (non-server) execution ──
+    # WhatDreamsCost-ComfyUI (LTXDirector, LTXDirectorGuide, LTXDirectorCropGuides)
+    # requires PromptServer.instance to exist at import time. In headless/Colab mode
+    # there is no running aiohttp server, so we create a minimal instance.
+    try:
+        from aiohttp import web  # noqa: F401
+        from server import PromptServer
+        if not hasattr(PromptServer, 'instance') or PromptServer.instance is None:
+            PromptServer.instance = PromptServer(asyncio.new_event_loop())
+    except Exception:
+        pass
+
+    # ── Fix: kornia compatibility for ComfyUI-LTXVideo ───────────────────────
+    # Some kornia versions removed kornia.geometry.transform.pyramid.pad which
+    # ComfyUI-LTXVideo relies on. Patch it with torch.nn.functional.pad.
+    try:
+        import kornia.geometry.transform.pyramid as _kpyr
+        if not hasattr(_kpyr, 'pad'):
+            import torch.nn.functional as F
+            _kpyr.pad = F.pad
+    except Exception:
+        pass
+
     from nodes import init_builtin_extra_nodes, init_external_custom_nodes
 
     async def _loader():
@@ -1369,10 +1392,17 @@ def get_conditioning_on_device(pos_cond, neg_cond):
 _MODEL_CACHE: Dict[str, Any] = {}
 
 
+# ── DiT model cache (prevents double-load OOM on T4) ─────────────────────────
+_DIT_MODEL_CACHE = None
+
+
 def load_dit_model(apply_loras: bool = True) -> Any:
     """
-    Load the LTX-2.3 22B GGUF DiT model (workflow node 135 — UnetLoaderGGUF)
+    Load the LTX-2.3 22B GGUF DiT model (workflow node 135 - UnetLoaderGGUF)
     and apply all 4 LoRAs at workflow strengths.
+
+    Uses a module-level cache so subsequent calls within the same chunk reuse
+    the already-loaded model instead of allocating a second 12-13 GB copy.
 
     LoRA application order (from JSON PowerLoraLoader node):
         1. lora_distilled  strength=0.4
@@ -1380,6 +1410,11 @@ def load_dit_model(apply_loras: bool = True) -> Any:
         3. lora_transition strength=0.7
         4. lora_mvcamera   strength=0.9
     """
+    global _DIT_MODEL_CACHE
+    if _DIT_MODEL_CACHE is not None:
+        print("  DiT model (from cache)")
+        return _DIT_MODEL_CACHE
+
     print("  Loading DiT model (UnetLoaderGGUF)...")
     mem.cleanup()
 
@@ -1407,10 +1442,21 @@ def load_dit_model(apply_loras: bool = True) -> Any:
                 print(f"  Applying LoRA: {fname}  strength={strength}")
                 model = lora_loader.load_lora_model_only(model, fname, strength)[0]
             else:
-                print(f"  ⚠ LoRA not found, skipping: {fname}")
+                print(f"  LoRA not found, skipping: {fname}")
 
-    print("  ✓ DiT model ready.")
+    _DIT_MODEL_CACHE = model
+    print("  DiT model ready.")
     return model
+
+
+def release_dit_model():
+    """Clear the DiT model cache and free GPU memory."""
+    global _DIT_MODEL_CACHE
+    if _DIT_MODEL_CACHE is not None:
+        del _DIT_MODEL_CACHE
+        _DIT_MODEL_CACHE = None
+        mem.aggressive_cleanup()
+        print("  DiT model released from cache.")
 
 
 def load_video_vae() -> Any:
@@ -1525,6 +1571,8 @@ def build_director_conditioning(
     height: int,
     segment_images: Optional[List[str]] = None,
     segment_prompts: Optional[List[str]] = None,
+    dit_model=None,
+    audio_vae=None,
 ) -> Tuple:
     """
     Run the LTXDirector node (workflow node 131) when available.
@@ -1553,9 +1601,11 @@ def build_director_conditioning(
     if "LTXDirector" in NODE_CLASS_MAPPINGS:
         print("  Using LTXDirector (WhatDreamsCost) node...")
 
-        # Load models needed by Director
-        dit_model = load_dit_model(apply_loras=True)
-        audio_vae = load_audio_vae()
+        # Load models needed by Director (reuse if already loaded)
+        if dit_model is None:
+            dit_model = load_dit_model(apply_loras=True)
+        if audio_vae is None:
+            audio_vae = load_audio_vae()
 
         # Load CLIP via DualCLIPLoader (same as build_text_conditioning, workflow node 12)
         # NOTE: The workflow routes CLIP through Power Lora Loader (node 138) before
@@ -1602,7 +1652,8 @@ def build_director_conditioning(
                 director_out = director.execute(**director_kwargs)
             except TypeError:
                 print("  LTXDirector call failed -- using fallback conditioning.")
-                return _build_director_fallback(pos_cond, neg_cond, num_frames, fps)
+                return _build_director_fallback(pos_cond, neg_cond, num_frames, fps,
+                                               dit_model=dit_model, audio_vae=audio_vae)
 
         # Extract all outputs per workflow node 131 output slots
         dir_model       = get_value_at_index(director_out, 0)
@@ -1617,18 +1668,29 @@ def build_director_conditioning(
                 dir_guide_data, dir_motion_data, dir_frame_rate)
 
     # -- Fallback: standard conditioning (no LTXDirector node) --
-    return _build_director_fallback(pos_cond, neg_cond, num_frames, fps)
+    return _build_director_fallback(pos_cond, neg_cond, num_frames, fps,
+                                    dit_model=dit_model, audio_vae=audio_vae)
 
 
-def _build_director_fallback(pos_cond, neg_cond, num_frames: int, fps: int) -> Tuple:
+def _build_director_fallback(pos_cond, neg_cond, num_frames: int, fps: int,
+                             dit_model=None, audio_vae=None) -> Tuple:
     """
     Fallback when LTXDirector is not available.
     Returns the same tuple shape as build_director_conditioning but with
     None for guide_data, motion_guide_data, and generates empty audio latent.
+
+    Accepts optional dit_model and audio_vae to avoid redundant loads when
+    the caller (e.g. generate_chunk) has already loaded these models.
     """
     print("  LTXDirector node not found -- using standard conditioning fallback.")
-    dit_model = load_dit_model(apply_loras=True)
-    audio_vae = load_audio_vae()
+    if dit_model is None:
+        dit_model = load_dit_model(apply_loras=True)
+    else:
+        print("  Reusing pre-loaded DiT model (no double-load).")
+    if audio_vae is None:
+        audio_vae = load_audio_vae()
+    else:
+        print("  Reusing pre-loaded audio VAE.")
 
     ltxvemptylatentaudio = get_node("LTXVEmptyLatentAudio")
     audio_lat = ltxvemptylatentaudio.EXECUTE_NORMALIZED(
@@ -2262,13 +2324,13 @@ def generate_chunk(
         video_vae = load_video_vae()
         audio_vae = load_audio_vae()
 
-        # -- 3. Load DiT + LoRAs --
-        dit_model = load_dit_model(apply_loras=True)
-
-        # -- 4. Load upscaler --
+        # -- 3. Load upscaler --
         upscaler = load_upscaler_model()
 
-        # -- 5. Build LTXDirector conditioning or fallback --
+        # -- 4. Build LTXDirector conditioning or fallback --
+        # DiT model is loaded inside build_director_conditioning (or its fallback)
+        # via load_dit_model() which uses a cache. We do NOT load it here separately
+        # to avoid having two copies in VRAM simultaneously (OOM on T4).
         # LTXDirector returns: (model, positive, video_latent, audio_latent,
         #                        guide_data, motion_guide_data, frame_rate)
         director_result = build_director_conditioning(
@@ -2280,12 +2342,14 @@ def generate_chunk(
             fps=fps,
             width=width,
             height=height,
+            audio_vae=audio_vae,
         )
         (dir_model, dir_positive, dir_video_latent, dir_audio_latent,
          dir_guide_data, dir_motion_guide_data, dir_frame_rate) = director_result
 
-        # Use director model if available, otherwise use loaded dit_model
-        base_model = dir_model if dir_model is not None else dit_model
+        # Use director model as the base model for both sampling passes.
+        # This is the ONLY copy of the DiT in memory.
+        base_model = dir_model
 
         # -- 6. Determine video latent for pass 1 --
         # When LTXDirector provides video_latent, use it directly (no empty latents needed).
@@ -2460,12 +2524,14 @@ def generate_chunk(
             pass_name=f"Pass2 (chunk {idx})",
         )
 
-        del latent_for_sampler2, model_g2, dit_model
-        # Ensure no lingering reference to base_model keeps the DiT alive
+        del latent_for_sampler2, model_g2
+        # Release the DiT model cache and base_model reference to free VRAM
+        # before decode (which needs the memory for frame tensors).
         try:
             del base_model
         except NameError:
             pass
+        release_dit_model()
         mem.cleanup()
 
         # -- 16. Separate final AV latent (workflow node 22) --
@@ -2631,6 +2697,8 @@ def adaptive_chunk_generator(
                 print(f"  GPU MEMORY   : {mem.gpu_free_gb():.2f} GB free")
                 print(f"  RETRY        : {retries}/{max_retries}")
 
+                # Release cached DiT model before cleanup to free VRAM
+                release_dit_model()
                 mem.aggressive_cleanup()
 
                 if not auto_reduce or retries > max_retries:
@@ -2654,6 +2722,7 @@ def adaptive_chunk_generator(
                 print(f"  TRACEBACK    :\n{traceback.format_exc()}")
                 checkpoint["failed_chunks"].append(idx)
                 save_checkpoint(checkpoint)
+                release_dit_model()
                 mem.aggressive_cleanup()
                 break  # Non-OOM errors: skip chunk, continue
 

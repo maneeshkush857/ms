@@ -1,0 +1,8 @@
+{
+  "task_id": "task-fix-cuda-oom-double-load",
+  "task_description": "Fix CUDA OOM crash caused by DiT model being loaded twice (once in generate_chunk step 3, once in _build_director_fallback) and custom node import failures (PromptServer, kornia).",
+  "status": "in_progress",
+  "feature_order": ["FEAT-001"],
+  "blocked_reason": null,
+  "verification": null
+}
