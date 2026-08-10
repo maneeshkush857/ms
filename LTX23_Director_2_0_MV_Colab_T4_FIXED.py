@@ -635,16 +635,48 @@ class _ModelCache:
             return self._upscaler
 
     def evict_unet(self):
+        # BUG-A FIX: was mem.cleanup() (soft) — must be aggressive_cleanup() to
+        # actually release the ~12 GB DiT. A single gc.collect() is not enough
+        # when ComfyUI's ModelPatcher holds additional tensor references.
         with self._lock:
             if self._unet is not None:
-                del self._unet
+                del self._unet          # explicit del before None-assign
                 self._unet = None
-        mem.cleanup()
+        mem.aggressive_cleanup()        # 3× GC + synchronize + empty_cache + ipc_collect
         print("   🗑️ [ModelCache] UNet evicted.")
 
-    def evict_all(self):
+    def evict_vaes(self):
+        """
+        BUG-D FIX: Evict video_vae and audio_vae from VRAM.
+        Called before VAE decode so decode scratch has room to allocate.
+        VAEs are reloaded cheaply from disk at the start of the next chunk.
+        """
         with self._lock:
+            _vv = self._video_vae
+            _av = self._audio_vae
+            self._video_vae = None
+            self._audio_vae = None
+        if _vv is not None:
+            del _vv
+        if _av is not None:
+            del _av
+        mem.aggressive_cleanup()
+        print("   🗑️ [ModelCache] VAEs evicted (freeing VRAM for decode).")
+
+    def evict_all(self):
+        # BUG-C FIX: was `self._unet = self._video_vae = ... = None` without del.
+        # Python's refcount stays > 1 if ComfyUI holds internal references.
+        # Explicit del reduces refcount by 1 before None-assignment so GC can collect.
+        with self._lock:
+            _u  = self._unet
+            _vv = self._video_vae
+            _av = self._audio_vae
+            _up = self._upscaler
             self._unet = self._video_vae = self._audio_vae = self._upscaler = None
+        if _u  is not None: del _u
+        if _vv is not None: del _vv
+        if _av is not None: del _av
+        if _up is not None: del _up
         mem.aggressive_cleanup()
         print("   🗑️ [ModelCache] All models evicted.")
 
@@ -1379,15 +1411,52 @@ def load_dit_model(apply_loras: bool = True) -> Any:
         return MODEL_CACHE.get_unet(_load)
     return _load()
 
+def _clear_comfy_model_cache():
+    """
+    BUG-E FIX: Clear ComfyUI's internal model_management cache.
+
+    ComfyUI wraps every loaded model in a ModelPatcher and appends it to
+    `comfy.model_management.current_loaded_models`.  As long as that list
+    holds a reference the Python refcount stays > 0, so gc.collect() +
+    empty_cache() can never free the VRAM — exactly what we saw in the log
+    (VRAM stayed at 13 GB after release_dit_model()).
+
+    We call unload_all_models() which moves all models to CPU and removes
+    them from the list, dropping refcount to 0 so the next gc sweep actually
+    frees the GPU tensors.
+    """
+    try:
+        import comfy.model_management as mm
+        mm.unload_all_models()          # moves models to CPU, clears internal list
+        mm.soft_empty_cache()           # comfy's own empty_cache wrapper
+        print("  [comfy] model_management cache cleared.")
+    except Exception as e:
+        print(f"  [comfy] Could not clear model_management cache: {e}")
+
+
 def release_dit_model():
+    """
+    BUG-B FIX: aggressive_cleanup was only called when _DIT_MODEL_CACHE was
+    not None — which is NEVER true when USE_MODEL_CACHE=True (the model lives
+    in MODEL_CACHE._unet, not _DIT_MODEL_CACHE).  The biggest sweep of the
+    chunk therefore silently never ran.
+
+    Fix: call _clear_comfy_model_cache() then mem.aggressive_cleanup()
+    unconditionally, regardless of which cache path was used.
+    """
     global _DIT_MODEL_CACHE
+    # Step 1 — drop our own Python references
     if MODEL_CACHE is not None:
-        MODEL_CACHE.evict_unet()
+        MODEL_CACHE.evict_unet()            # explicit del + aggressive_cleanup (Bug-A fix)
     if _DIT_MODEL_CACHE is not None:
         del _DIT_MODEL_CACHE
         _DIT_MODEL_CACHE = None
-        mem.aggressive_cleanup()
-        print("  DiT model released.")
+    # Step 2 — clear ComfyUI's internal ModelPatcher references (Bug-E fix)
+    _clear_comfy_model_cache()
+    # Step 3 — unconditional aggressive sweep (Bug-B fix: was behind dead branch)
+    mem.aggressive_cleanup()
+    print("  DiT model released.")
+    print_vram_usage("  ")              # confirm VRAM actually dropped
 
 def load_video_vae() -> Any:
     def _load():
@@ -2164,6 +2233,32 @@ def generate_chunk(
         if not mem.is_ram_safe(required_gb=3.0):
             print(f"  ⚠ RAM critically low ({mem.cpu_available_gb():.2f} GB) before decode!")
 
+        # ── Stage 17b: BUG-D FIX — evict cached VAEs before decode ───────────
+        # When ModelCache is ON, video_vae (~2 GB) and audio_vae (~1 GB) have been
+        # resident in VRAM since Stage 2/7 of this chunk.  After releasing the DiT
+        # at Stage 15, we still have ~3 GB of stuck VAE weights, leaving only ~1.4 GB
+        # free — not enough for the VAEDecode scratch allocation that crashes the session.
+        #
+        # Fix: evict both VAEs now, run a full ComfyUI + VRAM sweep, then reload
+        # them fresh below.  The reload is cheap (< 1s from VRAM-backed CPU memory)
+        # and the total VRAM needed for decode drops from ~15 GB to ~3–4 GB.
+        if MODEL_CACHE is not None:
+            MODEL_CACHE.evict_vaes()       # explicit del + aggressive_cleanup
+            _clear_comfy_model_cache()     # drop ComfyUI's ModelPatcher references too
+            mem.aggressive_cleanup()
+            print_vram_usage("  ")         # verify VRAM freed before loading decode VAEs
+            # Reload video_vae fresh for decode — loaded ONLY at decode time
+            print("  Reloading video VAE for decode (fresh after eviction)...")
+            video_vae = load_video_vae()
+            # Reload audio_vae fresh for audio decode
+            print("  Reloading audio VAE for decode (fresh after eviction)...")
+            audio_vae = load_audio_vae()
+            mem.stage_cleanup("reload_vaes_for_decode")
+
+        # [MEM-6] RAM safety check before decode
+        if not mem.is_ram_safe(required_gb=3.0):
+            print(f"  ⚠ RAM critically low ({mem.cpu_available_gb():.2f} GB) before decode!")
+
         # ── Stage 18: Decode video ─────────────────────────────────────────────
         print_vram_usage("  ")                                 # [MEM-6] before decode
         frames_cpu = decode_video_latent(lat_crop54, video_vae)
@@ -2176,14 +2271,18 @@ def generate_chunk(
         mem.stage_cleanup("decode_audio")                      # [MEM-5]
 
         # ── Stage 20: Unload VAEs ──────────────────────────────────────────────
-        # [MEM-2] If ModelCache is disabled, delete VAEs; otherwise keep cached.
-        if MODEL_CACHE is None:
-            del video_vae, audio_vae
-            mem.cleanup()
+        # BUG-D FIX: VAEs were previously kept in ModelCache permanently.
+        # Now we evict them before decode (above) and evict again here after decode
+        # so they do NOT accumulate across chunks.  They reload at the start of each
+        # chunk in Stage 2/7 — load time is ~0.5s from disk (cached by OS).
+        if MODEL_CACHE is not None:
+            MODEL_CACHE.evict_vaes()
+            _clear_comfy_model_cache()
+            mem.aggressive_cleanup()
         else:
-            # Let ModelCache keep them; just release local references
-            video_vae = None; audio_vae = None
-        mem.stage_cleanup("vae_unload")                        # [MEM-5]
+            del video_vae, audio_vae
+            mem.aggressive_cleanup()
+        mem.stage_cleanup("vae_unload_post_decode")            # [MEM-5]
 
     # ── Stage 21: Save chunk to disk ──────────────────────────────────────────
     chunk_path = save_chunk_to_disk(frames_cpu, audio_cpu, idx, fps, width, height)
