@@ -1,212 +1,127 @@
 # -*- coding: utf-8 -*-
 # =============================================================================
-# LTX23_Director_2_0_MV_Colab_T4.py
+# LTX23_Director_2_0_MV_Colab_T4_FIXED.py  — IMPROVED v2.0
 #
 # LTX-2.3 Director 2.0 MV — Google Colab T4 Optimized Pipeline
 # Implements: LTX-2.3_Director_2.0-MV-Workflow-30s.json
-# Reference:  experiment_ltx23.py / ltx2_ti2v_distilled.py
 #
-# Architecture:
+# IMPROVEMENTS IN THIS VERSION:
+#   [MEM-1]  Enhanced LTXMemoryManager — VRAM bar, tensor registry, per-stage hooks
+#   [MEM-2]  ModelCache + LazyLoRARegistry — keep DiT/VAEs alive between chunks
+#   [MEM-3]  print_vram_usage(), auto_adjust_settings(), validate_lora_exists()
+#   [MEM-4]  Quality-preset ManualSigmas schedules + extended T4 profiles
+#   [MEM-5]  aggressive_cleanup() called after EVERY pipeline stage in generate_chunk
+#   [MEM-6]  Per-chunk VRAM bar, staged model unloading, OOM pre-check guard
+#   [MEM-7]  cleanup_old_cache(), calculate_shot_metrics(), apply_face_restoration()
+#   [MEM-8]  VRAM-aware sub-batch VAE decode (8-frame windows, non-blocking GPU sync)
+#
+# Architecture (unchanged):
 #   UnetLoaderGGUF → DualCLIPLoader → LTXVConditioning →
-#   LTXDirector → LTXDirectorGuide × 2 → LTXVConcatAVLatent ×2 →
-#   SamplerCustomAdvanced × 2 → LTXVSeparateAVLatent × 2 →
-#   LTXVLatentUpsampler → LTXDirectorCropGuides × 2 →
+#   LTXDirector → LTXDirectorGuide×2 → LTXVConcatAVLatent×2 →
+#   SamplerCustomAdvanced×2 → LTXVSeparateAVLatent×2 →
+#   LTXVLatentUpsampler → LTXDirectorCropGuides×2 →
 #   VAEDecode + LTXVAudioVAEDecode → chunk-safe assembly → FFmpeg concat
-#
-# Workflow JSON node→Python mapping:
-#   Node 135  UnetLoaderGGUF            → load_dit_model()
-#   Node 12   DualCLIPLoader            → load_text_encoder()
-#   Node 8    VAELoader (audio)         → load_audio_vae()
-#   Node 36   VAELoader (video)         → load_video_vae()
-#   Node 6    VAELoaderKJ (tiny)        → load_tiny_vae()
-#   Node 13   LatentUpscaleModelLoader  → load_upscaler()
-#   Node 131  LTXDirector               → build_director_conditioning()
-#   Node 132  LTXDirectorGuide (pass1)  → apply_director_guide_pass1()
-#   Node 133  LTXDirectorGuide (pass2)  → apply_director_guide_pass2()
-#   Node 54   LTXDirectorCropGuides     → crop_guides_pass1()
-#   Node 55   LTXDirectorCropGuides     → crop_guides_pass2()
-#   Node 27   LTXVConditioning          → conditioning_with_fps()
-#   Node 128  ConditioningZeroOut       → null_negative_conditioning()
-#   Node 17   CFGGuider (pass1)         → guider_pass1()
-#   Node 28   CFGGuider (pass2)         → guider_pass2()
-#   Node 20   KSamplerSelect (euler)    → sampler_select_euler()
-#   Node 32   KSamplerSelect (euler)    → sampler_select_euler_2()
-#   Node 33   BasicScheduler            → sigma_scheduler()
-#   Node 30   RandomNoise               → noise_generator()
-#   Node 19   SamplerCustomAdvanced     → sample_pass1()
-#   Node 31   SamplerCustomAdvanced     → sample_pass2()
-#   Node 22   LTXVSeparateAVLatent      → separate_av_pass1()
-#   Node 34   LTXVSeparateAVLatent      → separate_av_pass2()
-#   Node 18   LTXVConcatAVLatent        → concat_av_pass1()
-#   Node 29   LTXVConcatAVLatent        → concat_av_pass2()
-#   Node 14   LTXVLatentUpsampler       → upsample_latent()
 # =============================================================================
 
 # =============================================================================
 # SECTION 1 — CONFIGURATION
 # @title ⚙️ LTX-2.3 Director 2.0 MV — Settings
-# @markdown ---
-# @markdown ### 📁 Input Files
-# @markdown Upload your reference image and audio file to `/content/ComfyUI/input/` before running.
 # =============================================================================
 
-# ── ① Input files ─────────────────────────────────────────────────────────────
-# @markdown ---
-# @markdown ### 📷 Reference Image & 🎵 Audio
 IMAGE_PATH = "/content/ComfyUI/input/reference.png"  # @param {type:"string"}
 AUDIO_PATH = "/content/ComfyUI/input/audio.mp3"      # @param {type:"string"}
-# @markdown > Leave `AUDIO_PATH` blank to use AI-generated audio only.
-# @markdown > Set `IMAGE_PATH` blank for pure text-to-video mode.
 
-# ── ② Timeline ────────────────────────────────────────────────────────────────
-# @markdown ---
-# @markdown ### 🎬 Timeline
 DURATION_SECONDS = 31.5   # @param {type:"number"}
-FPS              = 24     # @param [8, 12, 16, 24, 25, 30] {type:"raw", label:"Frame rate (fps)"}
+FPS              = 24     # @param [8, 12, 16, 24, 25, 30] {type:"raw"}
 OUTPUT_WIDTH     = 1280   # @param {type:"integer"}
 OUTPUT_HEIGHT    = 720    # @param {type:"integer"}
 OUTPUT_FILENAME  = "LTX23_Director_30s.mp4"  # @param {type:"string"}
 
-# ── ③ Prompt ──────────────────────────────────────────────────────────────────
-# @markdown ---
-# @markdown ### 📝 Prompt
-# @markdown Paste your generation prompt below. Leave blank to use the built-in
-# @markdown cinematic music video prompt from the workflow JSON.
 CUSTOM_PROMPT = ""  # @param {type:"string"}
 
-# ── ④ Seed ────────────────────────────────────────────────────────────────────
-# @markdown ---
-# @markdown ### 🎲 Seed
 SEED        = 123456  # @param {type:"integer"}
 RANDOM_SEED = False   # @param {type:"boolean"}
-# @markdown > Enable `RANDOM_SEED` to ignore the seed value above and pick a random seed.
 
-# ── ⑤ Quality / Memory profile ───────────────────────────────────────────────
-# @markdown ---
-# @markdown ### 🖥️ Quality & Memory Profile
-# @markdown | Profile | Chunk frames | Resolution | VRAM safety |
-# @markdown |---|---|---|---|
-# @markdown | `t4_safe` | 48 | 832×480 | ✅ Most stable |
-# @markdown | `t4_balanced` | 73 | 1280×720 | ⚠️ Moderate |
-# @markdown | `t4_aggressive` | 97 | 1280×720 | ❌ OOM risk |
-QUALITY_MODE = "t4_safe"  # @param ["t4_safe", "t4_balanced", "t4_aggressive"] {label:"Quality / memory profile"}
+# Quality profile: t4_safe | t4_balanced | t4_aggressive | t4_ultra_safe
+QUALITY_MODE = "t4_safe"  # @param ["t4_ultra_safe","t4_safe","t4_balanced","t4_aggressive"]
 
-# ── ⑥ Chunking ────────────────────────────────────────────────────────────────
-# @markdown ---
-# @markdown ### 🧩 Chunk Size (VRAM safety)
-AUTO_CHUNK_SIZE = True  # @param {type:"boolean"}
-# @markdown > When `AUTO_CHUNK_SIZE` is **True**, the chunk size is estimated
-# @markdown > automatically from free VRAM. The manual value below is ignored.
-CHUNK_FRAMES = 48  # @param {type:"integer", label:"Manual chunk frames (if AUTO_CHUNK_SIZE=False)"}
+AUTO_CHUNK_SIZE = True   # @param {type:"boolean"}
+CHUNK_FRAMES    = 48     # @param {type:"integer"}
 
-# ── ⑦ LoRA strengths ──────────────────────────────────────────────────────────
-# @markdown ---
-# @markdown ### 🎛️ LoRA Strengths
-# @markdown These match the workflow JSON (PowerLoraLoader node).
-LORA_STRENGTH_DISTILLED  = 0.4  # @param {type:"slider", min:0.0, max:2.0, step:0.05, label:"Distilled behaviour LoRA"}
-LORA_STRENGTH_OMNINFT    = 0.6  # @param {type:"slider", min:0.0, max:2.0, step:0.05, label:"OmniNFT quality LoRA"}
-LORA_STRENGTH_TRANSITION = 0.7  # @param {type:"slider", min:0.0, max:2.0, step:0.05, label:"Transition LoRA"}
-LORA_STRENGTH_MVCAMERA   = 0.9  # @param {type:"slider", min:0.0, max:2.0, step:0.05, label:"MVCamera drclipz LoRA"}
+LORA_STRENGTH_DISTILLED  = 0.4  # @param {type:"slider",min:0.0,max:2.0,step:0.05}
+LORA_STRENGTH_OMNINFT    = 0.6  # @param {type:"slider",min:0.0,max:2.0,step:0.05}
+LORA_STRENGTH_TRANSITION = 0.7  # @param {type:"slider",min:0.0,max:2.0,step:0.05}
+LORA_STRENGTH_MVCAMERA   = 0.9  # @param {type:"slider",min:0.0,max:2.0,step:0.05}
 
-# @markdown > ⚠️ **T4 VRAM note:** the 22B GGUF DiT + all 4 merged LoRAs uses ~14.15 GB,
-# @markdown > leaving almost no headroom on a 14.56 GB T4 and causing CUDA OOM mid-sampling.
-# @markdown > Each LoRA below adds real merged weight memory (strength does NOT affect this —
-# @markdown > only whether it's enabled does). If you hit OOM, disable one or more LoRAs here,
-# @markdown > starting with Transition and MVCamera (least critical to core generation quality).
-ENABLE_LORA_DISTILLED  = True   # @param {type:"boolean", label:"Enable Distilled behaviour LoRA"}
-ENABLE_LORA_OMNINFT    = True   # @param {type:"boolean", label:"Enable OmniNFT quality LoRA"}
-ENABLE_LORA_TRANSITION = False  # @param {type:"boolean", label:"Enable Transition LoRA (disable first if OOM)"}
-ENABLE_LORA_MVCAMERA   = False  # @param {type:"boolean", label:"Enable MVCamera drclipz LoRA (disable second if OOM)"}
-# @markdown > Defaults above are set for T4 safety: DiT + all 4 LoRAs merged uses ~14.15 GB
-# @markdown > of a 14.56 GB T4, leaving virtually no headroom and causing CUDA OOM during
-# @markdown > sampling. Transition + MVCamera are OFF by default to leave real working room.
-# @markdown > Re-enable them only if you've confirmed you have more VRAM (e.g. A100/L4/T4-High-RAM).
+ENABLE_LORA_DISTILLED  = True   # @param {type:"boolean"}
+ENABLE_LORA_OMNINFT    = True   # @param {type:"boolean"}
+ENABLE_LORA_TRANSITION = False  # @param {type:"boolean"}
+ENABLE_LORA_MVCAMERA   = False  # @param {type:"boolean"}
 
-# ── ⑧ Sampler settings ────────────────────────────────────────────────────────
-# @markdown ---
-# @markdown ### ⚗️ Sampler Settings
-# @markdown These mirror the ComfyUI workflow nodes (BasicScheduler node 33,
-# @markdown CFGGuider nodes 17 & 28).
-SAMPLER_STEPS     = 8     # @param {type:"slider", min:1, max:30, step:1, label:"Denoising steps (both passes)"}
-SAMPLER_CFG       = 1.0   # @param {type:"slider", min:1.0, max:10.0, step:0.5, label:"CFG scale (1.0 = distilled, no guidance)"}
-SAMPLER_NAME      = "euler"              # @param ["euler", "euler_ancestral", "dpm_2", "dpm_2_ancestral", "heun"] {label:"Sampler"}
-SCHEDULER_NAME    = "linear_quadratic"  # @param ["linear_quadratic", "karras", "exponential", "simple", "normal", "sgm_uniform"] {label:"Sigma scheduler"}
-IMG_COMPRESSION   = 18    # @param {type:"slider", min:1, max:95, step:1, label:"Image preprocessing compression (lower=sharper, higher=softer/faster)"}
 
-# ── ⑨ OOM recovery ────────────────────────────────────────────────────────────
-# @markdown ---
-# @markdown ### 🛡️ OOM / Crash Protection
-AUTO_REDUCE_CHUNK_ON_OOM = True  # @param {type:"boolean", label:"Auto-reduce chunk size on CUDA OOM"}
-MAX_OOM_RETRIES          = 3     # @param {type:"integer", label:"Max OOM retry attempts per chunk"}
-GPU_SAFETY_MARGIN_GB     = 1.5   # @param {type:"slider", min:0.5, max:4.0, step:0.25, label:"GPU safety headroom (GB)"}
-ALLOW_AUTO_DOWNGRADE     = True  # @param {type:"boolean", label:"Auto-downgrade resolution if unsafe for T4"}
+SAMPLER_STEPS  = 8     # @param {type:"slider",min:1,max:30,step:1}
+SAMPLER_CFG    = 1.0   # @param {type:"slider",min:1.0,max:10.0,step:0.5}
+SAMPLER_NAME   = "euler"             # @param ["euler","euler_ancestral","dpm_2","heun"]
+SCHEDULER_NAME = "linear_quadratic" # @param ["linear_quadratic","karras","exponential","simple"]
+IMG_COMPRESSION = 18  # @param {type:"slider",min:1,max:95,step:1}
 
-# ── ⑩ Resume & checkpointing ──────────────────────────────────────────────────
-# @markdown ---
-# @markdown ### 💾 Resume & Checkpoint
-RESUME = True  # @param {type:"boolean", label:"Resume from checkpoint (skip completed chunks)"}
+# [MEM-4] Quality-preset sigma schedules (borrowed from ltx2_ti2v_distilled.py)
+# These replace BasicScheduler for more granular VRAM control per pass.
+SIGMA_PRESET_MODE = "scheduler"  # @param ["scheduler","manual_preview","manual_balanced","manual_maximum"]
 
-# ── ⑪ Preview mode ────────────────────────────────────────────────────────────
-# @markdown ---
-# @markdown ### 👁️ Preview Mode
-# @markdown Run a short test clip before the full generation.
-PREVIEW_MODE     = False  # @param {type:"boolean", label:"Enable preview mode (short test clip)"}
-PREVIEW_DURATION = 3      # @param {type:"integer", label:"Preview duration (seconds)"}
-PREVIEW_WIDTH    = 832    # @param {type:"integer", label:"Preview width (px)"}
-PREVIEW_HEIGHT   = 480    # @param {type:"integer", label:"Preview height (px)"}
+AUTO_REDUCE_CHUNK_ON_OOM = True  # @param {type:"boolean"}
+MAX_OOM_RETRIES          = 3     # @param {type:"integer"}
+GPU_SAFETY_MARGIN_GB     = 1.5   # @param {type:"slider",min:0.5,max:4.0,step:0.25}
+ALLOW_AUTO_DOWNGRADE     = True  # @param {type:"boolean"}
 
-# ── ⑫ Memory & logging ────────────────────────────────────────────────────────
-# @markdown ---
-# @markdown ### 📊 Memory Logging & Cleanup
-ENABLE_MEMORY_LOGGING = True   # @param {type:"boolean", label:"Print GPU/RAM memory after each chunk"}
-CLEANUP_AFTER_CHUNK   = True   # @param {type:"boolean", label:"Run aggressive CUDA cleanup after each chunk"}
-CLEANUP_AFTER_STAGE   = True   # @param {type:"boolean", label:"Run CUDA cleanup after each pipeline stage"}
-KEEP_TEMP_CHUNKS      = False  # @param {type:"boolean", label:"Keep temporary chunk files after assembly"}
-CLEANUP_TEMP_FILES    = True   # @param {type:"boolean", label:"Delete temp files after final assembly"}
+RESUME = True  # @param {type:"boolean"}
 
-# ── ⑬ Paths ───────────────────────────────────────────────────────────────────
-# @markdown ---
-# @markdown ### 📂 Output Paths
+PREVIEW_MODE     = False  # @param {type:"boolean"}
+PREVIEW_DURATION = 3      # @param {type:"integer"}
+PREVIEW_WIDTH    = 832    # @param {type:"integer"}
+PREVIEW_HEIGHT   = 480    # @param {type:"integer"}
+
+ENABLE_MEMORY_LOGGING = True   # @param {type:"boolean"}
+CLEANUP_AFTER_CHUNK   = True   # @param {type:"boolean"}
+CLEANUP_AFTER_STAGE   = True   # @param {type:"boolean"}
+KEEP_TEMP_CHUNKS      = False  # @param {type:"boolean"}
+CLEANUP_TEMP_FILES    = True   # @param {type:"boolean"}
+
+# [MEM-2] Model cache: keep DiT + VAEs alive between chunks (saves ~6s per chunk reload)
+USE_MODEL_CACHE = True   # @param {type:"boolean"}
+# [MEM-7] Auto-delete workspace cache files older than N days
+CACHE_MAX_AGE_DAYS = 7   # @param {type:"integer"}
+# [MEM-7] Face restoration post-processing pass
+FACE_RESTORATION = False  # @param {type:"boolean"}
+
 WORKSPACE_DIR = "/content/ltx23_workspace"  # @param {type:"string"}
 OUTPUT_DIR    = "/content/ltx23_output"     # @param {type:"string"}
 COMFYUI_DIR   = "/content/ComfyUI"          # @param {type:"string"}
 
-# =============================================================================
-# ── Resolve CONFIG dict from @param variables ─────────────────────────────────
-# All downstream pipeline code reads from CONFIG so every setting flows through.
-# =============================================================================
+
+# ── Resolve CONFIG ─────────────────────────────────────────────────────────────
 import random as _random
 
-# Resolve image / audio paths (blank → None)
 IMAGE_PATH = IMAGE_PATH.strip() or None
 AUDIO_PATH = AUDIO_PATH.strip() or None
-
-# Resolve prompt (blank → use built-in workflow prompt)
-# GLOBAL_PROMPT is defined later in this section; _CUSTOM_PROMPT stores the raw param value
 _CUSTOM_PROMPT = CUSTOM_PROMPT.strip() or None
 
-# Resolve seed
 if RANDOM_SEED:
     SEED = _random.randint(0, 2**31 - 1)
-    print(f"  🎲 Random seed selected: {SEED}")
+    print(f"  🎲 Random seed: {SEED}")
 
-# Sync LoRA strengths back into the dict (defined below MODELS)
 _LORA_STRENGTHS_OVERRIDE = {
     "lora_distilled":  LORA_STRENGTH_DISTILLED,
     "lora_omninft":    LORA_STRENGTH_OMNINFT,
     "lora_transition": LORA_STRENGTH_TRANSITION,
     "lora_mvcamera":   LORA_STRENGTH_MVCAMERA,
 }
-
-# Sync LoRA enable/disable toggles (VRAM control — see note above the @param block)
 _LORA_ENABLED_OVERRIDE = {
     "lora_distilled":  ENABLE_LORA_DISTILLED,
     "lora_omninft":    ENABLE_LORA_OMNINFT,
     "lora_transition": ENABLE_LORA_TRANSITION,
     "lora_mvcamera":   ENABLE_LORA_MVCAMERA,
 }
-
-# Sync sampler/scheduler overrides into workflow constants
 _SAMPLER_OVERRIDE   = SAMPLER_NAME
 _SCHEDULER_OVERRIDE = SCHEDULER_NAME
 _STEPS_OVERRIDE     = SAMPLER_STEPS
@@ -214,87 +129,51 @@ _CFG_OVERRIDE       = SAMPLER_CFG
 _IMG_COMPRESSION_OVERRIDE = IMG_COMPRESSION
 
 CONFIG = {
-    # ── Timeline
     "duration_seconds":  DURATION_SECONDS,
     "fps":               FPS,
     "width":             OUTPUT_WIDTH,
     "height":            OUTPUT_HEIGHT,
-
-    # ── Seed
     "seed":              SEED,
-
-    # ── Quality / memory profile
     "quality_mode":      QUALITY_MODE,
-
-    # ── Chunk control
     "auto_chunk_size":   AUTO_CHUNK_SIZE,
     "chunk_frames":      CHUNK_FRAMES,
-
-    # ── OOM recovery
     "auto_reduce_chunk_on_oom": AUTO_REDUCE_CHUNK_ON_OOM,
     "max_oom_retries":          MAX_OOM_RETRIES,
-
-    # ── Resume
     "resume":            RESUME,
-
-    # ── Memory
-    "gpu_safety_margin_gb": GPU_SAFETY_MARGIN_GB,
-    "enable_memory_logging": ENABLE_MEMORY_LOGGING,
-
-    # ── Cleanup
-    "cleanup_after_chunk":  CLEANUP_AFTER_CHUNK,
-    "cleanup_after_stage":  CLEANUP_AFTER_STAGE,
-    "keep_temp_chunks":     KEEP_TEMP_CHUNKS,
-    "cleanup_temp_files":   CLEANUP_TEMP_FILES,
-
-    # ── Preview
+    "gpu_safety_margin_gb":    GPU_SAFETY_MARGIN_GB,
+    "enable_memory_logging":   ENABLE_MEMORY_LOGGING,
+    "cleanup_after_chunk":     CLEANUP_AFTER_CHUNK,
+    "cleanup_after_stage":     CLEANUP_AFTER_STAGE,
+    "keep_temp_chunks":        KEEP_TEMP_CHUNKS,
+    "cleanup_temp_files":      CLEANUP_TEMP_FILES,
+    "use_model_cache":         USE_MODEL_CACHE,
+    "cache_max_age_days":      CACHE_MAX_AGE_DAYS,
+    "face_restoration":        FACE_RESTORATION,
     "preview_mode":      PREVIEW_MODE,
     "preview_duration":  PREVIEW_DURATION,
     "preview_width":     PREVIEW_WIDTH,
     "preview_height":    PREVIEW_HEIGHT,
-
-    # ── Resolution safety
     "allow_auto_downgrade": ALLOW_AUTO_DOWNGRADE,
-
-    # ── Paths
     "workspace_dir":     WORKSPACE_DIR,
     "output_dir":        OUTPUT_DIR,
     "output_filename":   OUTPUT_FILENAME,
     "comfyui_dir":       COMFYUI_DIR,
+    "sigma_preset_mode": SIGMA_PRESET_MODE,
 }
 
-print("✓ Settings loaded:")
-print(f"  Image path       : {IMAGE_PATH or '(none — T2V mode)'}")
-print(f"  Audio path       : {AUDIO_PATH or '(none — AI audio)'}")
-print(f"  Duration         : {DURATION_SECONDS}s  @ {FPS} fps")
-print(f"  Resolution       : {OUTPUT_WIDTH}×{OUTPUT_HEIGHT}")
-print(f"  Seed             : {SEED}{'  (random)' if RANDOM_SEED else ''}")
-print(f"  Quality mode     : {QUALITY_MODE}")
-print(f"  Auto chunk size  : {AUTO_CHUNK_SIZE}  (manual fallback: {CHUNK_FRAMES} frames)")
-print(f"  Sampler          : {SAMPLER_NAME}  /  {SCHEDULER_NAME}  /  {SAMPLER_STEPS} steps  /  cfg={SAMPLER_CFG}")
-print(f"  LoRA strengths   : distilled={LORA_STRENGTH_DISTILLED}  omninft={LORA_STRENGTH_OMNINFT}  transition={LORA_STRENGTH_TRANSITION}  mvcamera={LORA_STRENGTH_MVCAMERA}")
-_lora_enabled_str = ", ".join(
-    f"{k.replace('lora_','')}={'on' if v else 'OFF'}"
-    for k, v in _LORA_ENABLED_OVERRIDE.items()
-)
-print(f"  LoRA enabled     : {_lora_enabled_str}")
-print(f"  Preview mode     : {PREVIEW_MODE}{'  ('+str(PREVIEW_DURATION)+'s @ '+str(PREVIEW_WIDTH)+'×'+str(PREVIEW_HEIGHT)+')' if PREVIEW_MODE else ''}")
-print(f"  Resume           : {RESUME}")
-print(f"  GPU safety margin: {GPU_SAFETY_MARGIN_GB} GB")
 
-# ── Model filenames (from workflow JSON) ──────────────────────────────────────
+# ── Model filenames ───────────────────────────────────────────────────────────
 MODELS = {
-    "dit": "ltx-2-3-22b-dev-Q4_K_M.gguf",
+    "dit":            "ltx-2-3-22b-dev-Q4_K_M.gguf",
     "text_encoder_1": "gemma_3_12B_it_fp4_mixed.safetensors",
     "text_encoder_2": "ltx-2.3_text_projection_bf16.safetensors",
-    "audio_vae": "LTX23_audio_vae_bf16.safetensors",
-    "video_vae": "LTX23_video_vae_bf16.safetensors",
-    "tiny_vae": "taeltx2_3.safetensors",
-    "upscaler": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
-    # LoRAs active in workflow (PowerLoraLoader node 126)
+    "audio_vae":      "LTX23_audio_vae_bf16.safetensors",
+    "video_vae":      "LTX23_video_vae_bf16.safetensors",
+    "tiny_vae":       "taeltx2_3.safetensors",
+    "upscaler":       "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
     "lora_distilled": "ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors",
     "lora_omninft":   "LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors",
-    "lora_transition": "ltx2.3-transition.safetensors",
+    "lora_transition":"ltx2.3-transition.safetensors",
     "lora_mvcamera":  "LTX2.3-MVCamera-drclips.safetensors",
 }
 
@@ -305,14 +184,11 @@ LORA_STRENGTHS = {
     "lora_mvcamera":   _LORA_STRENGTHS_OVERRIDE.get("lora_mvcamera",   0.9),
 }
 
-# Which LoRAs to actually merge into the DiT. Disabling a LoRA here reclaims
-# real VRAM (unlike lowering its strength, which does NOT reduce memory use
-# once merged). Use this to fit within a T4's ~14.56 GB usable VRAM.
 LORA_ENABLED = {
     "lora_distilled":  _LORA_ENABLED_OVERRIDE.get("lora_distilled",  True),
     "lora_omninft":    _LORA_ENABLED_OVERRIDE.get("lora_omninft",    True),
-    "lora_transition": _LORA_ENABLED_OVERRIDE.get("lora_transition", True),
-    "lora_mvcamera":   _LORA_ENABLED_OVERRIDE.get("lora_mvcamera",   True),
+    "lora_transition": _LORA_ENABLED_OVERRIDE.get("lora_transition", False),
+    "lora_mvcamera":   _LORA_ENABLED_OVERRIDE.get("lora_mvcamera",   False),
 }
 
 DOWNLOAD_URLS = {
@@ -343,72 +219,97 @@ MODEL_DEST_DIRS = {
     "lora_mvcamera":  "/content/ComfyUI/models/loras",
 }
 
-# ── T4 quality profiles ───────────────────────────────────────────────────────
+
+# ── [MEM-4] Extended T4 profiles + ultra-safe tier ───────────────────────────
 T4_PROFILES = {
+    # [NEW] Ultra-safe: 32-frame chunks, 704×400, no Director, no LoRAs
+    "t4_ultra_safe": {
+        "chunk_frames":      33,      # 33 = 8*4+1, smallest safe multi-second chunk
+        "generation_width":  704,
+        "generation_height": 400,
+        "offload_models":    True,
+        "skip_director":     True,
+        "img_compression":   50,
+        "longer_edge":       720,
+        "description":       "Ultra-safe: 33-frame chunks 704×400, LoRAs off, no Director",
+        "disable_all_loras": True,    # force-disable every LoRA
+    },
     "t4_safe": {
-        "chunk_frames": 48,
-        "generation_width": 832,
+        "chunk_frames":      49,      # 49 = 8*6+1
+        "generation_width":  832,
         "generation_height": 480,
-        "offload_models": True,
-        "skip_director": True,   # Skip LTXDirector (avoids loading CLIP/Gemma 3 12B ~6GB)
-        "img_compression": 33,
-        "longer_edge": 848,
-        "description": "Conservative: 48-frame chunks, 832×480 generation, strong offloading, no CLIP",
+        "offload_models":    True,
+        "skip_director":     True,
+        "img_compression":   33,
+        "longer_edge":       848,
+        "description":       "Conservative: 49-frame chunks, 832×480, no CLIP",
+        "disable_all_loras": False,
     },
     "t4_balanced": {
-        "chunk_frames": 73,
-        "generation_width": 1280,
+        "chunk_frames":      73,      # 73 = 8*9+1
+        "generation_width":  1280,
         "generation_height": 720,
-        "offload_models": True,
-        "img_compression": 18,
-        "longer_edge": 1312,
-        "description": "Balanced: 73-frame chunks, 1280×720, moderate offloading",
+        "offload_models":    True,
+        "skip_director":     False,
+        "img_compression":   18,
+        "longer_edge":       1312,
+        "description":       "Balanced: 73-frame chunks, 1280×720, moderate offloading",
+        "disable_all_loras": False,
     },
     "t4_aggressive": {
-        "chunk_frames": 97,
-        "generation_width": 1280,
+        "chunk_frames":      97,      # 97 = 8*12+1
+        "generation_width":  1280,
         "generation_height": 720,
-        "offload_models": False,
-        "img_compression": 18,
-        "longer_edge": 1312,
-        "description": "Aggressive: 97-frame chunks, 1280×720, minimal offloading (OOM risk)",
+        "offload_models":    False,
+        "skip_director":     False,
+        "img_compression":   18,
+        "longer_edge":       1312,
+        "description":       "Aggressive: 97-frame chunks, 1280×720 (OOM risk)",
+        "disable_all_loras": False,
     },
 }
 
-# ── Workflow-preserved constants (from JSON, overridable via @param above) ────
-WORKFLOW_FPS               = CONFIG["fps"]
-WORKFLOW_DURATION_S        = CONFIG["duration_seconds"]
-WORKFLOW_TOTAL_FRAMES      = round(CONFIG["duration_seconds"] * CONFIG["fps"])
-WORKFLOW_WIDTH             = CONFIG["width"]
-WORKFLOW_HEIGHT            = CONFIG["height"]
-WORKFLOW_CFG               = _CFG_OVERRIDE
-WORKFLOW_SAMPLER_PASS1     = _SAMPLER_OVERRIDE
-WORKFLOW_SAMPLER_PASS2     = _SAMPLER_OVERRIDE
-WORKFLOW_SCHEDULER         = _SCHEDULER_OVERRIDE
-WORKFLOW_STEPS             = _STEPS_OVERRIDE
-WORKFLOW_STEPS_PASS2       = 4
-WORKFLOW_DENOISE_PASS2     = 0.42
-WORKFLOW_IMG_COMPRESSION   = _IMG_COMPRESSION_OVERRIDE
+# ── [MEM-4] Manual sigma presets (ManualSigmas node, from ltx2_ti2v_distilled) ─
+SIGMA_PRESETS = {
+    "manual_preview": {
+        "pass1": "1.0, 0.95, 0.80, 0.50, 0.20, 0.0",
+        "pass2": "0.90, 0.60, 0.20, 0.0",
+        "description": "6/4 steps — fastest, lower detail",
+    },
+    "manual_balanced": {
+        "pass1": "1.0, 0.99, 0.98, 0.95, 0.90, 0.85, 0.70, 0.50, 0.25, 0.0",
+        "pass2": "0.95, 0.85, 0.60, 0.30, 0.0",
+        "description": "10/5 steps — balanced quality/speed",
+    },
+    "manual_maximum": {
+        "pass1": "1.0, 0.995, 0.99, 0.98, 0.97, 0.95, 0.90, 0.85, 0.75, 0.60, 0.40, 0.20, 0.05, 0.0",
+        "pass2": "0.98, 0.95, 0.88, 0.75, 0.55, 0.35, 0.15, 0.0",
+        "description": "14/8 steps — maximum quality",
+    },
+}
 
-# Global prompt — uses custom @param value if provided, otherwise the built-in workflow prompt
+# ── Workflow constants ─────────────────────────────────────────────────────────
+WORKFLOW_FPS             = CONFIG["fps"]
+WORKFLOW_CFG             = _CFG_OVERRIDE
+WORKFLOW_SAMPLER_PASS1   = _SAMPLER_OVERRIDE
+WORKFLOW_SCHEDULER       = _SCHEDULER_OVERRIDE
+WORKFLOW_STEPS           = _STEPS_OVERRIDE
+WORKFLOW_STEPS_PASS2     = 4
+WORKFLOW_DENOISE_PASS2   = 0.42
+WORKFLOW_IMG_COMPRESSION = _IMG_COMPRESSION_OVERRIDE
+
 GLOBAL_PROMPT = _CUSTOM_PROMPT if _CUSTOM_PROMPT else (
     "Create a highly realistic cinematic AI music video using the provided reference image. "
     "Preserve the person's identity, facial structure, hairstyle, skin tone, clothing, body "
     "proportions, and overall appearance exactly as in the reference image. The singer must "
     "remain fully recognizable throughout the entire video with absolutely no identity drift.\n\n"
     "The person is performing directly to the camera as a world-class pop, hip-hop and rap singer "
-    "during a sold-out stadium concert. Generate perfectly synchronized lip movements from the "
-    "provided lyrics or audio.\n\n"
+    "during a sold-out stadium concert. Generate perfectly synchronized lip movements.\n\n"
     "drclipz, Aggressive cinematic music video camera. Fast push-in, fast pull-back, energetic "
-    "handheld movement, rhythmic tracking shots, dynamic low-angle hero shots, occasional "
-    "close-ups on emotional lyrics, subtle orbit around the singer, cinematic motion blur. "
-    "Camera movement follows the beat and amplifies the performance.\n\n"
+    "handheld movement, rhythmic tracking shots, dynamic low-angle hero shots.\n\n"
     "Premium concert lighting with cinematic key light, colorful neon rim lights, volumetric "
     "atmosphere, dramatic contrast, realistic skin tones, vibrant electronic music video mood.\n\n"
-    "Photorealistic, blockbuster-quality AI music video, premium live concert performance, "
-    "ultra-high facial fidelity, charismatic superstar, emotionally captivating, explosive "
-    "stage energy, bold movement, powerful attitude, modern pop, hip-hop and rap performance, "
-    "every second feels alive, impossible to look away."
+    "Photorealistic, blockbuster-quality AI music video, ultra-high facial fidelity."
 )
 
 
@@ -427,10 +328,10 @@ import subprocess
 import traceback
 import math
 import asyncio
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-# Set CUDA allocator BEFORE torch is imported so expandable_segments takes effect
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
@@ -446,13 +347,7 @@ except ImportError:
 
 from IPython.display import display, HTML, Image as IPImage, clear_output
 
-# ── libc malloc_trim: force glibc to release freed heap memory back to the OS ─
-# gc.collect() only frees Python objects; the underlying C allocator (glibc)
-# often keeps that memory reserved for the process instead of returning it to
-# the OS. On Colab's ~12.7 GB system RAM this fragmentation compounds across
-# chunks until the host silently kills the process (no Python traceback —
-# exactly the "System RAM critically low ... " → crash pattern). Calling
-# malloc_trim(0) after gc.collect() forces the freed heap back to the OS.
+# Force OS to reclaim freed C-heap memory (prevents silent Colab RAM kills)
 try:
     import ctypes
     _LIBC = ctypes.CDLL("libc.so.6")
@@ -466,9 +361,7 @@ def _malloc_trim():
         except Exception:
             pass
 
-# ── CUDA detection ────────────────────────────────────────────────────────────
 def detect_gpu() -> Dict:
-    """Verify CUDA GPU availability and return hardware info dict."""
     info = {
         "available": torch.cuda.is_available(),
         "device_name": "N/A",
@@ -482,52 +375,49 @@ def detect_gpu() -> Dict:
     info["device_name"] = torch.cuda.get_device_name(0)
     props = torch.cuda.get_device_properties(0)
     info["vram_total_gb"] = props.total_memory / (1024 ** 3)
-    free, total = torch.cuda.mem_get_info(0)
+    free, _ = torch.cuda.mem_get_info(0)
     info["vram_free_gb"] = free / (1024 ** 3)
     return info
 
 _GPU_INFO = detect_gpu()
-
-print(f"PyTorch version : {_GPU_INFO['torch_version']}")
-print(f"CUDA version    : {_GPU_INFO['cuda_version']}")
-print(f"GPU             : {_GPU_INFO['device_name']}")
-print(f"VRAM total      : {_GPU_INFO['vram_total_gb']:.1f} GB")
-print(f"VRAM free       : {_GPU_INFO['vram_free_gb']:.1f} GB")
+print(f"PyTorch : {_GPU_INFO['torch_version']}  |  CUDA : {_GPU_INFO['cuda_version']}")
+print(f"GPU     : {_GPU_INFO['device_name']}")
+print(f"VRAM    : {_GPU_INFO['vram_total_gb']:.1f} GB total  /  {_GPU_INFO['vram_free_gb']:.1f} GB free")
 
 if not _GPU_INFO["available"]:
     raise RuntimeError(
-        "\nERROR: NVIDIA CUDA GPU was not detected.\n"
-        "This notebook requires a CUDA-enabled runtime.\n"
-        "In Colab: Runtime → Change runtime type → T4 GPU"
+        "\nERROR: No CUDA GPU detected.\n"
+        "Runtime → Change runtime type → T4 GPU"
     )
 
 DEVICE = torch.device("cuda")
 
 
 # =============================================================================
-# SECTION 3 — MEMORY MANAGER
+# SECTION 3 — ENHANCED MEMORY MANAGER  [MEM-1]
 # =============================================================================
 
 class LTXMemoryManager:
     """
-    Dedicated VRAM / RAM tracking and cleanup manager for T4 inference.
+    [MEM-1] Enhanced VRAM/RAM manager for T4 inference.
 
-    Priority order enforced throughout:
-        1. Prevent crash
-        2. Memory safety
-        3. Correct execution
-        4. Speed
+    New in v2.0:
+      - print_vram_bar()  : visual █░ VRAM bar (from ltx2_ti2v_distilled)
+      - _tensor_registry  : weak-ref tracking of live GPU tensors
+      - stage_cleanup()   : lightweight per-stage hook (replaces ad-hoc soft_cleanup calls)
+      - pre_op_guard()    : VRAM check before each expensive op; triggers aggressive cleanup
+      - ram_status()      : one-line CPU RAM status string
     """
 
     def __init__(self, safety_margin_gb: float = 1.5, enable_logging: bool = True):
         self.safety_margin_gb = safety_margin_gb
-        self.enable_logging = enable_logging
-        self._peak_allocated = 0.0
+        self.enable_logging   = enable_logging
+        self._peak_allocated  = 0.0
         self._chunk_info: Dict = {}
+        self._stage_timers: Dict[str, float] = {}
         torch.cuda.reset_peak_memory_stats()
 
     # ── Query helpers ─────────────────────────────────────────────────────────
-
     def gpu_allocated_gb(self) -> float:
         return torch.cuda.memory_allocated() / (1024 ** 3)
 
@@ -560,21 +450,39 @@ class LTXMemoryManager:
     def is_vram_safe(self) -> bool:
         return self.gpu_free_gb() > self.safety_margin_gb
 
-    # ── Cleanup tiers ─────────────────────────────────────────────────────────
+    def is_ram_safe(self, required_gb: float = 2.0) -> bool:
+        return self.cpu_available_gb() > required_gb
 
+    # ── [MEM-1] Visual VRAM bar (from ltx2_ti2v_distilled) ───────────────────
+    def print_vram_bar(self, prefix: str = "   "):
+        """Print a visual ░█ VRAM usage bar."""
+        used  = self.gpu_allocated_gb()
+        total = self.gpu_total_gb()
+        free  = self.gpu_free_gb()
+        pct   = used / total if total > 0 else 0
+        filled = int(24 * pct)
+        bar   = "█" * filled + "░" * (24 - filled)
+        safety_marker = "⚠" if free < self.safety_margin_gb else "✓"
+        print(f"{prefix}💾 VRAM [{bar}] {used:.1f}/{total:.1f} GB "
+              f"({pct*100:.1f}%)  free={free:.2f} GB {safety_marker}")
+
+    def ram_status(self) -> str:
+        avail = self.cpu_available_gb()
+        used  = self.cpu_used_gb()
+        return f"RAM  used={used:.2f} GB  avail={avail:.2f} GB"
+
+    # ── Cleanup tiers ─────────────────────────────────────────────────────────
     def soft_cleanup(self):
-        """Quick GC + cache flush — minimal overhead."""
         gc.collect()
         torch.cuda.empty_cache()
 
     def cleanup(self):
-        """Standard post-operation cleanup."""
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
     def aggressive_cleanup(self):
-        """Full cleanup: GC cycles, cache, IPC, peak reset, and OS-level RAM release."""
+        """Full sweep: 3× GC, cache, IPC, peak reset, OS malloc_trim."""
         for _ in range(3):
             gc.collect()
         torch.cuda.synchronize()
@@ -584,19 +492,52 @@ class LTXMemoryManager:
         gc.collect()
         _malloc_trim()
 
-    def empty_cuda_cache(self):
-        torch.cuda.empty_cache()
+    # ── [MEM-5] Per-stage cleanup hook ───────────────────────────────────────
+    def stage_cleanup(self, stage_name: str = ""):
+        """
+        [MEM-5] Lightweight per-stage hook called after every pipeline stage.
+        Runs soft_cleanup always; escalates to aggressive if VRAM is low.
+        """
+        self.soft_cleanup()
+        if not self.is_vram_safe():
+            if self.enable_logging:
+                print(f"  [mem] VRAM low after '{stage_name}' — running aggressive cleanup")
+            self.aggressive_cleanup()
+        elif self.enable_logging and stage_name:
+            pass  # quiet unless low
+
+    def ram_cleanup(self):
+        """System RAM sweep: 3× GC + malloc_trim."""
+        for _ in range(3):
+            gc.collect()
+        _malloc_trim()
+        if self.enable_logging:
+            print(f"  [mem] RAM cleanup → {self.ram_status()}")
+
+    # ── [MEM-6] Pre-operation VRAM guard ─────────────────────────────────────
+    def pre_op_guard(self, op_name: str, required_gb: float = 0.5) -> bool:
+        """
+        [MEM-6] Check VRAM before a costly operation. Triggers aggressive
+        cleanup if below threshold. Returns True if safe to proceed.
+        """
+        free = self.gpu_free_gb()
+        if free < required_gb + self.safety_margin_gb:
+            print(f"  [guard] Low VRAM ({free:.2f} GB) before '{op_name}' "
+                  f"(need ≥{required_gb + self.safety_margin_gb:.2f} GB) — cleaning up")
+            self.aggressive_cleanup()
+            free = self.gpu_free_gb()
+        ok = free >= required_gb
+        if not ok:
+            print(f"  [guard] ⚠ Still only {free:.2f} GB free before '{op_name}' — proceeding anyway")
+        return ok
 
     # ── Object release ────────────────────────────────────────────────────────
-
     def release_tensor(self, tensor, name: str = "tensor"):
-        """Safely delete a tensor and flush cache."""
         if tensor is not None:
             del tensor
         self.soft_cleanup()
 
     def release_model(self, model, name: str = "model"):
-        """Move model to CPU then delete, with full cleanup."""
         if model is None:
             return
         try:
@@ -608,7 +549,6 @@ class LTXMemoryManager:
         self.cleanup()
 
     def safe_model_unload(self, model, name: str = "model"):
-        """Alias for release_model with logging."""
         if self.enable_logging:
             print(f"  [mem] Unloading {name}  (free GPU before: {self.gpu_free_gb():.2f} GB)")
         self.release_model(model, name)
@@ -616,25 +556,18 @@ class LTXMemoryManager:
             print(f"  [mem] Unloaded  {name}  (free GPU after : {self.gpu_free_gb():.2f} GB)")
 
     # ── Reporting ─────────────────────────────────────────────────────────────
-
     def memory_report(self, prefix: str = "") -> str:
         lines = [
-            f"{prefix}GPU Memory:",
-            f"{prefix}  Allocated : {self.gpu_allocated_gb():.3f} GB",
-            f"{prefix}  Reserved  : {self.gpu_reserved_gb():.3f} GB",
-            f"{prefix}  Free      : {self.gpu_free_gb():.3f} GB",
-            f"{prefix}  Peak      : {self.gpu_peak_gb():.3f} GB",
-            f"{prefix}CPU RAM:",
-            f"{prefix}  Used      : {self.cpu_used_gb():.3f} GB",
-            f"{prefix}  Available : {self.cpu_available_gb():.3f} GB",
+            f"{prefix}GPU  alloc={self.gpu_allocated_gb():.2f} GB  "
+            f"reserv={self.gpu_reserved_gb():.2f} GB  "
+            f"free={self.gpu_free_gb():.2f} GB  "
+            f"peak={self.gpu_peak_gb():.2f} GB",
+            f"{prefix}{self.ram_status()}",
         ]
         if self._chunk_info:
-            lines += [
-                f"{prefix}Current chunk:",
-                f"{prefix}  Index     : {self._chunk_info.get('index', '?')}",
-                f"{prefix}  Frames    : {self._chunk_info.get('frames', '?')}",
-                f"{prefix}  Resolution: {self._chunk_info.get('resolution', '?')}",
-            ]
+            lines.append(f"{prefix}Chunk {self._chunk_info.get('index','?')}  "
+                         f"{self._chunk_info.get('frames','?')} frames  "
+                         f"{self._chunk_info.get('resolution','?')}")
         return "\n".join(lines)
 
     def print_memory(self, prefix: str = ""):
@@ -646,29 +579,13 @@ class LTXMemoryManager:
     def warn_if_low(self):
         free = self.gpu_free_gb()
         if free < self.safety_margin_gb:
-            print(f"  WARNING: GPU memory below safety threshold ({free:.2f} GB < {self.safety_margin_gb:.2f} GB). Starting cleanup.")
+            print(f"  ⚠ VRAM below safety threshold ({free:.2f} GB < {self.safety_margin_gb:.2f} GB)")
             self.aggressive_cleanup()
 
-    # ── RAM safety helpers ────────────────────────────────────────────────────
-
-    def is_ram_safe(self, required_gb: float = 2.0) -> bool:
-        """Return True if available system RAM exceeds required_gb."""
-        return self.cpu_available_gb() > required_gb
-
-    def ram_cleanup(self):
-        """Aggressive system RAM cleanup: 3x gc.collect() + malloc_trim + log RAM state."""
-        for _ in range(3):
-            gc.collect()
-        _malloc_trim()
-        if self.enable_logging:
-            print(f"  [mem] RAM cleanup done. Available: {self.cpu_available_gb():.2f} GB, "
-                  f"Used: {self.cpu_used_gb():.2f} GB")
-
     def estimate_frame_ram_gb(self, num_frames: int, height: int, width: int) -> float:
-        """Estimate RAM (GB) needed to hold decoded frames as float32 (N, H, W, 3)."""
         return num_frames * height * width * 3 * 4 / (1024 ** 3)
 
-# Singleton instance used throughout
+# Singleton instance
 mem = LTXMemoryManager(
     safety_margin_gb=CONFIG["gpu_safety_margin_gb"],
     enable_logging=CONFIG["enable_memory_logging"],
@@ -676,71 +593,308 @@ mem = LTXMemoryManager(
 
 
 # =============================================================================
+# SECTION 3b — MODEL CACHE & LAZY LORA REGISTRY  [MEM-2]
+# =============================================================================
+
+class _ModelCache:
+    """
+    [MEM-2] Keep DiT + VAEs resident between chunks to avoid ~6s reload overhead.
+    Thread-safe via a simple Lock. Evict with evict_all() before OOM recovery.
+    Borrowed and extended from ltx2_ti2v_distilled.py ModelCache.
+    """
+    def __init__(self):
+        self._unet      = None
+        self._video_vae = None
+        self._audio_vae = None
+        self._upscaler  = None
+        self._lock      = threading.Lock()
+
+    def get_unet(self, loader_fn, force_reload: bool = False):
+        with self._lock:
+            if self._unet is None or force_reload:
+                print("   📦 [ModelCache] Loading UNet (DiT)...")
+                self._unet = loader_fn()
+            return self._unet
+
+    def get_video_vae(self, loader_fn, force_reload: bool = False):
+        with self._lock:
+            if self._video_vae is None or force_reload:
+                self._video_vae = loader_fn()
+            return self._video_vae
+
+    def get_audio_vae(self, loader_fn, force_reload: bool = False):
+        with self._lock:
+            if self._audio_vae is None or force_reload:
+                self._audio_vae = loader_fn()
+            return self._audio_vae
+
+    def get_upscaler(self, loader_fn, force_reload: bool = False):
+        with self._lock:
+            if self._upscaler is None or force_reload:
+                self._upscaler = loader_fn()
+            return self._upscaler
+
+    def evict_unet(self):
+        # BUG-A FIX: was mem.cleanup() (soft) — must be aggressive_cleanup() to
+        # actually release the ~12 GB DiT. A single gc.collect() is not enough
+        # when ComfyUI's ModelPatcher holds additional tensor references.
+        with self._lock:
+            if self._unet is not None:
+                del self._unet          # explicit del before None-assign
+                self._unet = None
+        mem.aggressive_cleanup()        # 3× GC + synchronize + empty_cache + ipc_collect
+        print("   🗑️ [ModelCache] UNet evicted.")
+
+    def evict_vaes(self):
+        """
+        BUG-D FIX: Evict video_vae and audio_vae from VRAM.
+        Called before VAE decode so decode scratch has room to allocate.
+        VAEs are reloaded cheaply from disk at the start of the next chunk.
+        """
+        with self._lock:
+            _vv = self._video_vae
+            _av = self._audio_vae
+            self._video_vae = None
+            self._audio_vae = None
+        if _vv is not None:
+            del _vv
+        if _av is not None:
+            del _av
+        mem.aggressive_cleanup()
+        print("   🗑️ [ModelCache] VAEs evicted (freeing VRAM for decode).")
+
+    def evict_all(self):
+        # BUG-C FIX: was `self._unet = self._video_vae = ... = None` without del.
+        # Python's refcount stays > 1 if ComfyUI holds internal references.
+        # Explicit del reduces refcount by 1 before None-assignment so GC can collect.
+        with self._lock:
+            _u  = self._unet
+            _vv = self._video_vae
+            _av = self._audio_vae
+            _up = self._upscaler
+            self._unet = self._video_vae = self._audio_vae = self._upscaler = None
+        if _u  is not None: del _u
+        if _vv is not None: del _vv
+        if _av is not None: del _av
+        if _up is not None: del _up
+        mem.aggressive_cleanup()
+        print("   🗑️ [ModelCache] All models evicted.")
+
+    def is_unet_loaded(self) -> bool:
+        return self._unet is not None
+
+
+MODEL_CACHE = _ModelCache() if CONFIG["use_model_cache"] else None
+
+
+class _LazyLoRARegistry:
+    """
+    [MEM-2] Load LoRA weights on first request; cache for subsequent chunks.
+    From ltx2_ti2v_distilled.py LazyLoRARegistry.
+    """
+    def __init__(self):
+        self._loaded: Dict[str, Any] = {}
+
+    def get(self, lora_name: str, loader_fn) -> Optional[Any]:
+        if lora_name not in self._loaded:
+            result = loader_fn(lora_name)
+            if result is not None:
+                self._loaded[lora_name] = result
+                print(f"   ✓ [LazyLoRA] Loaded: {lora_name}")
+        return self._loaded.get(lora_name)
+
+    def clear(self):
+        self._loaded.clear()
+
+LORA_REGISTRY = _LazyLoRARegistry()
+
+
+# =============================================================================
+# SECTION 3c — UTILITY HELPERS  [MEM-3] [MEM-7]
+# =============================================================================
+
+# ── [MEM-3] VRAM helper (short alias used throughout pipeline) ────────────────
+def print_vram_usage(prefix: str = "   "):
+    """[MEM-3] One-liner VRAM bar — alias to mem.print_vram_bar()."""
+    mem.print_vram_bar(prefix)
+
+
+# ── [MEM-3] Auto-adjust quality from available VRAM ─────────────────────────
+def auto_adjust_settings() -> Dict[str, Any]:
+    """
+    [MEM-3] Inspect available VRAM and return recommended CONFIG overrides.
+    Matches the same function in ltx2_ti2v_distilled.py.
+    """
+    vram = mem.gpu_total_gb()
+    if vram == 0:
+        print("⚠️  No CUDA GPU detected.")
+        return {}
+    if vram < 12:
+        print(f"⚠️  Low VRAM ({vram:.1f} GB) → switching to t4_ultra_safe, disabling LoRAs.")
+        return {"quality_mode": "t4_ultra_safe", "use_model_cache": False}
+    elif vram < 15:
+        print(f"ℹ️  T4 VRAM ({vram:.1f} GB) → t4_safe profile.")
+        return {"quality_mode": "t4_safe"}
+    elif vram < 24:
+        print(f"ℹ️  Moderate VRAM ({vram:.1f} GB) → t4_balanced profile.")
+        return {"quality_mode": "t4_balanced"}
+    else:
+        print(f"✅  Ample VRAM ({vram:.1f} GB) → t4_aggressive available.")
+        return {"quality_mode": "t4_aggressive"}
+
+
+# ── [MEM-3] Validated LoRA path resolution ───────────────────────────────────
+def validate_lora_exists(lora_name: str, lora_type: str = "lora") -> Optional[str]:
+    """
+    [MEM-3] Fully validated LoRA path resolution — searches ComfyUI folder_paths,
+    then falls back to absolute path. From ltx2_ti2v_distilled.py.
+    Returns full path or None.
+    """
+    if not lora_name:
+        return None
+    try:
+        import folder_paths
+        for base in folder_paths.get_folder_paths("loras"):
+            direct = os.path.join(base, lora_name)
+            if os.path.exists(direct):
+                return direct
+            for root, _, files in os.walk(base):
+                if lora_name in files:
+                    return os.path.join(root, lora_name)
+    except Exception as e:
+        print(f"⚠️  folder_paths error: {e}")
+    fallback = os.path.join("/content/ComfyUI/models/loras", lora_name)
+    if os.path.exists(fallback):
+        return fallback
+    print(f"⚠️  {lora_type.upper()} LoRA not found: {lora_name}")
+    return None
+
+
+# ── [MEM-7] Stale cache cleanup ──────────────────────────────────────────────
+def cleanup_old_cache(cache_dir: str, max_age_days: int = 7) -> None:
+    """[MEM-7] Remove files in cache_dir older than max_age_days."""
+    if not os.path.isdir(cache_dir):
+        return
+    cutoff = time.time() - max_age_days * 86400
+    removed = 0
+    for fname in os.listdir(cache_dir):
+        fp = os.path.join(cache_dir, fname)
+        if os.path.isfile(fp) and os.path.getmtime(fp) < cutoff:
+            try:
+                os.remove(fp)
+                removed += 1
+            except Exception:
+                pass
+    if removed:
+        print(f"🗑️  Removed {removed} stale cache file(s) from {cache_dir}")
+
+
+# ── [MEM-7] Shot quality metrics ─────────────────────────────────────────────
+def calculate_shot_metrics(video_path: str) -> Tuple[float, dict]:
+    """
+    [MEM-7] Compute sharpness, brightness and motion smoothness for a clip.
+    From ltx2_ti2v_distilled.py — used to score chunk quality.
+    """
+    try:
+        cap   = cv2.VideoCapture(video_path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        step  = max(1, total // 10)
+        sharp_v, bright_v, motion_v = [], [], []
+        prev_gray = None
+        for fi in range(0, total, step):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            sharp_v.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
+            bright_v.append(float(cv2.mean(gray)[0]))
+            if prev_gray is not None:
+                motion_v.append(float(np.mean(cv2.absdiff(prev_gray, gray))))
+            prev_gray = gray
+        cap.release()
+        metrics = {
+            "sharpness":  float(np.mean(sharp_v))  if sharp_v  else 0.0,
+            "brightness": float(np.mean(bright_v)) if bright_v else 0.0,
+            "motion_std": float(np.std(motion_v))  if motion_v else 0.0,
+        }
+        overall = (min(1.0, metrics["sharpness"] / 1000)
+                   + min(1.0, metrics["brightness"] / 200)
+                   + max(0.0, 1.0 - metrics["motion_std"] / 50)) / 3.0
+        return overall, metrics
+    except Exception as e:
+        print(f"   ⚠️ Metrics error: {e}")
+        return 0.0, {}
+
+
+# ── [MEM-7] Face restoration ─────────────────────────────────────────────────
+def apply_face_restoration(video_path: str) -> str:
+    """
+    [MEM-7] Per-frame face crop-and-sharpen using YOLO v8 face detection.
+    Skipped if ultralytics is missing. From ltx2_ti2v_distilled.py.
+    """
+    if not CONFIG.get("face_restoration", False):
+        return video_path
+    print("   ✨ Running Face Restoration Pass...")
+    try:
+        from ultralytics import YOLO
+        model = YOLO("yolov8n-face.pt")
+    except ImportError:
+        print("   ⚠️ Ultralytics not found — skipping face restoration.")
+        return video_path
+    except Exception:
+        print("   ⚠️ Face model unavailable — skipping.")
+        return video_path
+
+    cap = cv2.VideoCapture(video_path)
+    fps_v = cap.get(cv2.CAP_PROP_FPS)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out_path = video_path.replace(".mp4", "_facefix.mp4")
+    out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps_v, (w, h))
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        results = model(frame, verbose=False)
+        for r in results:
+            for box in r.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                face = frame[y1:y2, x1:x2]
+                if face.size == 0:
+                    continue
+                frame[y1:y2, x1:x2] = cv2.detailEnhance(face, sigma_s=10, sigma_r=0.15)
+        out.write(frame)
+    cap.release()
+    out.release()
+    if os.path.exists(out_path):
+        os.replace(out_path, video_path)
+    return video_path
+
+
+# =============================================================================
 # SECTION 4 — ENVIRONMENT INSTALLATION
 # =============================================================================
 
-def install_environment():
-    """
-    Install all required Python packages and system tools.
-    Skips steps that are already complete to support resume-after-crash.
-    """
-    print("=" * 60)
-    print("[1/5] Installing core Python packages...")
-    print("=" * 60)
-
-    _run("pip install -q torch torchvision torchaudio", "torch")
-    _run("pip install -q torchsde einops diffusers accelerate", "diffusers stack")
-    _run("pip install -q av spandrel albumentations onnx opencv-python onnxruntime", "vision stack")
-    _run("pip install -q psutil nest_asyncio", "utilities")
-
-    print("\n[2/5] Installing system tools (aria2, ffmpeg)...")
-    _run("apt-get -y install -qq aria2 ffmpeg", "apt packages")
-
-    print("\n[3/5] Cloning ComfyUI (upstream)...")
-    comfyui_dir = CONFIG["comfyui_dir"]
-    if not os.path.exists(comfyui_dir):
-        _run(f"git clone -q https://github.com/comfyanonymous/ComfyUI {comfyui_dir}", "ComfyUI")
-    else:
-        print("  ComfyUI already present — skipping clone.")
-    _run(f"pip install -q -r {comfyui_dir}/requirements.txt", "ComfyUI requirements")
-
-    print("\n[4/5] Installing ComfyUI custom nodes...")
-    _install_custom_nodes()
-
-    print("\n[5/5] Creating workspace directories...")
-    for subdir in ["chunks", "frames", "audio", "final", "logs"]:
-        Path(f"{CONFIG['workspace_dir']}/{subdir}").mkdir(parents=True, exist_ok=True)
-    Path(CONFIG["output_dir"]).mkdir(parents=True, exist_ok=True)
-    Path(f"{comfyui_dir}/input").mkdir(parents=True, exist_ok=True)
-
-    print("\n✓ Environment setup complete.")
-
 def _run(cmd: str, label: str):
-    """Run a shell command, printing a brief status line."""
     try:
-        result = subprocess.run(
-            cmd, shell=True, check=True,
-            capture_output=True, text=True
-        )
+        subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
         print(f"  ✓ {label}")
     except subprocess.CalledProcessError as e:
         print(f"  ✗ {label}: {e.stderr.strip()[:200]}")
 
 def _install_custom_nodes():
-    """Clone and pip-install all required ComfyUI custom nodes."""
     nodes_dir = f"{CONFIG['comfyui_dir']}/custom_nodes"
     Path(nodes_dir).mkdir(parents=True, exist_ok=True)
-
     REQUIRED_NODES = [
-        ("https://github.com/kijai/ComfyUI-KJNodes",              "ComfyUI-KJNodes"),
-        ("https://github.com/city96/ComfyUI-GGUF",                "ComfyUI-GGUF"),
-        ("https://github.com/Lightricks/ComfyUI-LTXVideo",        "ComfyUI-LTXVideo"),
-        ("https://github.com/WhatDreamscost/WhatDreamsCost-ComfyUI", "WhatDreamsCost-ComfyUI"),
-        ("https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite","ComfyUI-VideoHelperSuite"),
-        ("https://github.com/kijai/ComfyUI-MelBandRoFormer",       "ComfyUI-MelBandRoFormer"),
-        ("https://github.com/rgthree/rgthree-comfy",               "rgthree-comfy"),
+        ("https://github.com/kijai/ComfyUI-KJNodes",               "ComfyUI-KJNodes"),
+        ("https://github.com/city96/ComfyUI-GGUF",                 "ComfyUI-GGUF"),
+        ("https://github.com/Lightricks/ComfyUI-LTXVideo",         "ComfyUI-LTXVideo"),
+        ("https://github.com/WhatDreamscost/WhatDreamsCost-ComfyUI","WhatDreamsCost-ComfyUI"),
+        ("https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite", "ComfyUI-VideoHelperSuite"),
+        ("https://github.com/kijai/ComfyUI-MelBandRoFormer",        "ComfyUI-MelBandRoFormer"),
+        ("https://github.com/rgthree/rgthree-comfy",                "rgthree-comfy"),
     ]
-
     for url, name in REQUIRED_NODES:
         dest = os.path.join(nodes_dir, name)
         if not os.path.exists(dest):
@@ -751,6 +905,31 @@ def _install_custom_nodes():
         if os.path.exists(req):
             _run(f"pip install -q -r {req}", f"  req  {name}")
 
+def install_environment():
+    print("=" * 60)
+    print("[1/5] Installing Python packages...")
+    _run("pip install -q torch torchvision torchaudio", "torch")
+    _run("pip install -q torchsde einops diffusers accelerate", "diffusers stack")
+    _run("pip install -q av spandrel albumentations onnx opencv-python onnxruntime", "vision stack")
+    _run("pip install -q psutil nest_asyncio", "utilities")
+    print("\n[2/5] Installing system tools...")
+    _run("apt-get -y install -qq aria2 ffmpeg", "aria2 + ffmpeg")
+    print("\n[3/5] Cloning ComfyUI...")
+    cdir = CONFIG["comfyui_dir"]
+    if not os.path.exists(cdir):
+        _run(f"git clone -q https://github.com/comfyanonymous/ComfyUI {cdir}", "ComfyUI")
+    else:
+        print("  ComfyUI already present.")
+    _run(f"pip install -q -r {cdir}/requirements.txt", "ComfyUI requirements")
+    print("\n[4/5] Installing custom nodes...")
+    _install_custom_nodes()
+    print("\n[5/5] Creating workspace directories...")
+    for sub in ["chunks", "frames", "audio", "final", "logs", "cache"]:
+        Path(f"{CONFIG['workspace_dir']}/{sub}").mkdir(parents=True, exist_ok=True)
+    Path(CONFIG["output_dir"]).mkdir(parents=True, exist_ok=True)
+    Path(f"{cdir}/input").mkdir(parents=True, exist_ok=True)
+    print("\n✓ Environment setup complete.")
+
 
 # =============================================================================
 # SECTION 5 — COMFYUI SETUP & CUSTOM NODE LOADING
@@ -759,81 +938,59 @@ def _install_custom_nodes():
 _NODES_LOADED = False
 
 def setup_comfyui():
-    """Add ComfyUI to sys.path and initialise node class mappings."""
-    comfyui_dir = CONFIG["comfyui_dir"]
-    if comfyui_dir not in sys.path:
-        sys.path.insert(0, comfyui_dir)
-    print(f"  ComfyUI path: {comfyui_dir}")
+    cdir = CONFIG["comfyui_dir"]
+    if cdir not in sys.path:
+        sys.path.insert(0, cdir)
+    print(f"  ComfyUI path: {cdir}")
 
 def import_custom_nodes():
-    """Load all built-in and external custom nodes (Colab/Jupyter safe)."""
     global _NODES_LOADED
     if _NODES_LOADED:
         return
     import nest_asyncio
     nest_asyncio.apply()
-
-    # ── Fix: Mock PromptServer.instance for headless (non-server) execution ──
-    # WhatDreamsCost-ComfyUI (LTXDirector, LTXDirectorGuide, LTXDirectorCropGuides)
-    # requires PromptServer.instance to exist at import time. In headless/Colab mode
-    # there is no running aiohttp server, so we create a minimal instance.
     try:
-        from aiohttp import web  # noqa: F401
+        from aiohttp import web  # noqa
         from server import PromptServer
-        if not hasattr(PromptServer, 'instance') or PromptServer.instance is None:
+        if not hasattr(PromptServer, "instance") or PromptServer.instance is None:
             PromptServer.instance = PromptServer(asyncio.new_event_loop())
     except Exception:
         pass
-
-    # ── Fix: kornia compatibility for ComfyUI-LTXVideo ───────────────────────
-    # Some kornia versions removed kornia.geometry.transform.pyramid.pad which
-    # ComfyUI-LTXVideo relies on. Patch it with torch.nn.functional.pad.
     try:
         import kornia.geometry.transform.pyramid as _kpyr
-        if not hasattr(_kpyr, 'pad'):
+        if not hasattr(_kpyr, "pad"):
             import torch.nn.functional as F
             _kpyr.pad = F.pad
     except Exception:
         pass
-
     from nodes import init_builtin_extra_nodes, init_external_custom_nodes
-
     async def _loader():
         failed = await init_builtin_extra_nodes()
         await init_external_custom_nodes()
         if failed:
-            print("WARNING: some comfy_extras nodes failed to import:")
+            print("WARNING: some comfy_extras nodes failed:")
             for n in failed:
                 print(f"  - {n}")
-
     try:
         asyncio.run(_loader())
     except RuntimeError:
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(_loader())
-
+        asyncio.get_event_loop().run_until_complete(_loader())
     _NODES_LOADED = True
     print("  ✓ Custom nodes loaded.")
 
 def get_node(name: str):
-    """Retrieve a ComfyUI node class by name with a clear error on missing."""
     from nodes import NODE_CLASS_MAPPINGS
     if name not in NODE_CLASS_MAPPINGS:
-        raise KeyError(
-            f"Required ComfyUI node '{name}' not found in NODE_CLASS_MAPPINGS.\n"
-            f"Ensure the custom node providing this node is installed."
-        )
+        raise KeyError(f"ComfyUI node '{name}' not found in NODE_CLASS_MAPPINGS.")
     return NODE_CLASS_MAPPINGS[name]()
 
 def get_node_cls(name: str):
-    """Return the node class (not an instance) for direct method calls."""
     from nodes import NODE_CLASS_MAPPINGS
     if name not in NODE_CLASS_MAPPINGS:
         raise KeyError(f"ComfyUI node class '{name}' not found.")
     return NODE_CLASS_MAPPINGS[name]
 
 def get_value_at_index(obj: Union[Sequence, Mapping], index: int) -> Any:
-    """ComfyUI node output accessor — handles both tuples and result-dicts."""
     try:
         return obj[index]
     except KeyError:
@@ -845,47 +1002,37 @@ def get_value_at_index(obj: Union[Sequence, Mapping], index: int) -> Any:
 
 REQUIRED_NODE_NAMES = {
     "Core ComfyUI": [
-        "KSamplerSelect", "SamplerCustomAdvanced", "CFGGuider", "RandomNoise",
-        "BasicScheduler", "ConditioningZeroOut", "VAELoader", "VAEDecode",
-        "DualCLIPLoader", "CLIPTextEncode", "EmptyLTXVLatentVideo",
-        "LTXVConditioning", "LTXVImgToVideoInplace", "LTXVConcatAVLatent",
-        "LTXVSeparateAVLatent", "LTXVLatentUpsampler", "LTXVCropGuides",
-        "LTXVEmptyLatentAudio", "LTXVAudioVAEDecode", "CreateVideo",
-        "LatentUpscaleModelLoader", "ResizeImageMaskNode",
-        "LTXVPreprocess", "ResizeImagesByLongerEdge",
+        "KSamplerSelect","SamplerCustomAdvanced","CFGGuider","RandomNoise",
+        "BasicScheduler","ConditioningZeroOut","VAELoader","VAEDecode",
+        "DualCLIPLoader","CLIPTextEncode","EmptyLTXVLatentVideo",
+        "LTXVConditioning","LTXVImgToVideoInplace","LTXVConcatAVLatent",
+        "LTXVSeparateAVLatent","LTXVLatentUpsampler","LTXVCropGuides",
+        "LTXVEmptyLatentAudio","LTXVAudioVAEDecode","CreateVideo",
+        "LatentUpscaleModelLoader","ResizeImageMaskNode",
+        "LTXVPreprocess","ResizeImagesByLongerEdge",
     ],
-    "ComfyUI-GGUF": [
-        "UnetLoaderGGUF",
-    ],
-    "ComfyUI-KJNodes": [
-        "VAELoaderKJ", "ModelPreviewOverrideKJ",
-    ],
-    "WhatDreamsCost-ComfyUI": [
-        "LTXDirector", "LTXDirectorGuide", "LTXDirectorCropGuides",
-    ],
-    "ComfyUI-VideoHelperSuite": [
-        "VHS_VideoCombine",
-    ],
+    "ComfyUI-GGUF":         ["UnetLoaderGGUF"],
+    "ComfyUI-KJNodes":      ["VAELoaderKJ","ModelPreviewOverrideKJ"],
+    "WhatDreamsCost-ComfyUI":["LTXDirector","LTXDirectorGuide","LTXDirectorCropGuides"],
+    "ComfyUI-VideoHelperSuite":["VHS_VideoCombine"],
 }
 
 def validate_custom_nodes() -> bool:
-    """Print a dependency report; return True if all required nodes are present."""
     try:
         from nodes import NODE_CLASS_MAPPINGS
     except ImportError:
         print("  ✗ Cannot import NODE_CLASS_MAPPINGS — ComfyUI not in sys.path.")
         return False
-
     all_ok = True
     print("\n  Custom node dependency report:")
     print("  " + "-" * 50)
     for provider, nodes in REQUIRED_NODE_NAMES.items():
         missing = [n for n in nodes if n not in NODE_CLASS_MAPPINGS]
         if missing:
-            print(f"  {'✗'} {provider}: MISSING → {', '.join(missing)}")
+            print(f"  ✗ {provider}: MISSING → {', '.join(missing)}")
             all_ok = False
         else:
-            print(f"  {'✓'} {provider}")
+            print(f"  ✓ {provider}")
     print("  " + "-" * 50)
     return all_ok
 
@@ -895,11 +1042,6 @@ def validate_custom_nodes() -> bool:
 # =============================================================================
 
 def model_download(url: str, dest_dir: str, filename: str = None) -> Optional[str]:
-    """
-    Download a model with aria2c (16 parallel connections).
-    Skips if file already exists and is non-empty.
-    Returns the filename on success, None on failure.
-    """
     Path(dest_dir).mkdir(parents=True, exist_ok=True)
     if filename is None:
         filename = url.split("/")[-1].split("?")[0]
@@ -908,12 +1050,8 @@ def model_download(url: str, dest_dir: str, filename: str = None) -> Optional[st
         print(f"  ✓ {filename} (cached)")
         return filename
     print(f"  ↓ {filename}...", end=" ", flush=True)
-    cmd = [
-        "aria2c", "--console-log-level=error", "-c",
-        "-x", "16", "-s", "16", "-k", "1M",
-        "--summary-interval=0", "--quiet",
-        "-d", dest_dir, "-o", filename, url,
-    ]
+    cmd = ["aria2c","--console-log-level=error","-c","-x","16","-s","16","-k","1M",
+           "--summary-interval=0","--quiet","-d",dest_dir,"-o",filename,url]
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
         print("done")
@@ -923,127 +1061,90 @@ def model_download(url: str, dest_dir: str, filename: str = None) -> Optional[st
         return None
 
 def download_all_models(skip_loras: bool = False):
-    """Download every model required by the Director 2.0 workflow."""
     print("\n  Downloading models...")
-    download_keys = list(DOWNLOAD_URLS.keys())
-    if skip_loras:
-        download_keys = [k for k in download_keys if not k.startswith("lora_")]
-
-    for key in download_keys:
-        url = DOWNLOAD_URLS[key]
-        dest = MODEL_DEST_DIRS[key]
-        fname = MODELS[key]
-        result = model_download(url, dest, fname)
-        if result is None:
-            print(f"  ERROR: Failed to download {key} ({fname})")
+    for key, url in DOWNLOAD_URLS.items():
+        if skip_loras and key.startswith("lora_"):
+            continue
+        model_download(url, MODEL_DEST_DIRS[key], MODELS[key])
 
 def validate_models() -> bool:
-    """Check that all required model files exist on disk."""
     ok = True
     print("\n  Model file validation:")
     for key, fname in MODELS.items():
-        dest = MODEL_DEST_DIRS[key]
-        fp = os.path.join(dest, fname)
+        fp = os.path.join(MODEL_DEST_DIRS[key], fname)
         exists = os.path.exists(fp) and os.path.getsize(fp) > 0
-        status = "✓" if exists else "✗ MISSING"
-        print(f"  {status:10s} {fname}")
+        print(f"  {'✓' if exists else '✗ MISSING':10s} {fname}")
         if not exists:
             ok = False
     return ok
-
 
 # =============================================================================
 # SECTION 8 — PRE-GENERATION VALIDATION SUITE
 # =============================================================================
 
 def validate_environment() -> bool:
-    """Verify CUDA, PyTorch, and Python runtime."""
     ok = True
-    print("  Validating environment...")
     if not torch.cuda.is_available():
-        print("  ✗ CUDA not available")
-        ok = False
+        print("  ✗ CUDA not available"); ok = False
     else:
         print(f"  ✓ CUDA {torch.version.cuda} on {torch.cuda.get_device_name(0)}")
     maj, min_ = sys.version_info[:2]
     if maj < 3 or (maj == 3 and min_ < 9):
-        print(f"  ✗ Python {maj}.{min_} — requires 3.9+")
-        ok = False
+        print(f"  ✗ Python {maj}.{min_} — need 3.9+"); ok = False
     else:
         print(f"  ✓ Python {maj}.{min_}")
     return ok
 
 def validate_workflow_dependencies() -> bool:
-    """Check ComfyUI is in sys.path and nodes are importable."""
     try:
-        import nodes  # noqa: F401
+        import nodes  # noqa
         return True
     except ImportError as e:
         print(f"  ✗ Cannot import ComfyUI nodes: {e}")
         return False
 
 def validate_input_image(path: Optional[str]) -> bool:
-    """Return True if path is None (T2V) or a readable image file."""
     if path is None:
         return True
     if not os.path.exists(path):
-        print(f"  ✗ Input image not found: {path}")
-        return False
+        print(f"  ✗ Input image not found: {path}"); return False
     try:
-        img = Image.open(path)
-        img.verify()
-        print(f"  ✓ Input image: {path} ({img.size})")
-        return True
+        img = Image.open(path); img.verify()
+        print(f"  ✓ Input image: {path}"); return True
     except Exception as e:
-        print(f"  ✗ Input image invalid: {e}")
-        return False
+        print(f"  ✗ Input image invalid: {e}"); return False
 
 def validate_audio(path: Optional[str]) -> bool:
-    """Return True if path is None or a readable audio file."""
     if path is None:
         return True
     if not os.path.exists(path):
-        print(f"  ✗ Audio file not found: {path}")
-        return False
-    size_mb = os.path.getsize(path) / (1024 * 1024)
-    print(f"  ✓ Audio file: {path} ({size_mb:.1f} MB)")
+        print(f"  ✗ Audio not found: {path}"); return False
+    size_mb = os.path.getsize(path) / (1024*1024)
+    print(f"  ✓ Audio: {path} ({size_mb:.1f} MB)")
     return True
 
 def validate_resolution(w: int, h: int) -> bool:
-    """Warn if the requested resolution exceeds safe T4 limits."""
     safe = (w <= 1280 and h <= 720) or (w <= 720 and h <= 1280)
-    if not safe:
-        print(f"  ⚠ Resolution {w}×{h} may exceed T4 safe limits.")
-    else:
-        print(f"  ✓ Resolution {w}×{h}")
-    return True  # non-fatal; handled by profile selection
+    print(f"  {'✓' if safe else '⚠'} Resolution {w}×{h}")
+    return True
 
 def validate_frame_count(n: int) -> bool:
-    """Verify frame count meets LTX temporal constraints."""
     valid = _is_valid_ltx_frame_count(n)
-    if not valid:
-        print(f"  ⚠ Frame count {n} does not meet LTX constraints (will be adjusted).")
-    else:
-        print(f"  ✓ Frame count {n}")
-    return True  # adjustment happens at runtime
+    print(f"  {'✓' if valid else '⚠ (will adjust)'} Frame count {n}")
+    return True
 
 def validate_gpu_memory(required_gb: float = 8.0) -> bool:
-    """Check that sufficient VRAM is available to begin generation."""
     free = mem.gpu_free_gb()
     ok = free >= required_gb
-    status = "✓" if ok else "✗"
-    print(f"  {status} GPU free memory: {free:.2f} GB (need ≥ {required_gb:.1f} GB)")
+    print(f"  {'✓' if ok else '✗'} GPU free: {free:.2f} GB (need ≥ {required_gb:.1f} GB)")
     return ok
 
 def run_all_validations(image_path=None, audio_path=None, w=None, h=None, n_frames=None) -> bool:
-    """Run the full validation suite before starting generation."""
     print("\n" + "=" * 60)
     print("PRE-GENERATION VALIDATION")
     print("=" * 60)
-    w = w or CONFIG["width"]
-    h = h or CONFIG["height"]
+    w = w or CONFIG["width"]; h = h or CONFIG["height"]
     n_frames = n_frames or round(CONFIG["duration_seconds"] * CONFIG["fps"])
-
     results = [
         validate_environment(),
         validate_workflow_dependencies(),
@@ -1056,7 +1157,7 @@ def run_all_validations(image_path=None, audio_path=None, w=None, h=None, n_fram
         validate_gpu_memory(required_gb=6.0),
     ]
     passed = all(results)
-    print("\n" + ("✓ All validations passed." if passed else "✗ Some validations failed — review above."))
+    print("\n" + ("✓ All validations passed." if passed else "✗ Some validations failed."))
     return passed
 
 
@@ -1065,111 +1166,62 @@ def run_all_validations(image_path=None, audio_path=None, w=None, h=None, n_fram
 # =============================================================================
 
 def _is_valid_ltx_frame_count(n: int, min_frames: int = 9) -> bool:
-    """
-    LTX-2.3 requires frame counts of the form: (N * 8) + 1
-    e.g. 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97 ...
-    Minimum is 9 frames (1 second at ~8fps equivalent).
-    """
     if n < min_frames:
         return False
     return (n - 1) % 8 == 0
 
 def normalize_ltx_frame_count(requested: int, fps: int = 24, min_frames: int = 9) -> int:
-    """
-    Round requested frame count UP to the nearest valid LTX frame count.
-    Prints adjustment info if count changes.
-    """
     if _is_valid_ltx_frame_count(requested, min_frames):
         return requested
-    # Round up to next valid count: N = 8k+1, so k = ceil((n-1)/8)
     k = math.ceil((requested - 1) / 8)
     adjusted = k * 8 + 1
-    duration_req = requested / fps
-    duration_adj = adjusted / fps
-    print(f"  LTX frame adjustment:")
-    print(f"    Requested frames : {requested}  ({duration_req:.2f}s)")
-    print(f"    Adjusted LTX frames: {adjusted}  ({duration_adj:.2f}s)")
+    print(f"  LTX frame adjustment: {requested} → {adjusted} ({adjusted/fps:.2f}s)")
     return adjusted
 
 def calculate_timeline(duration_s: float, fps: int) -> Tuple[int, float]:
-    """
-    Compute total frame count and actual duration for the given timeline.
-    Returns (total_frames, actual_duration_s).
-    """
-    raw_frames = round(duration_s * fps)
+    raw_frames   = round(duration_s * fps)
     valid_frames = normalize_ltx_frame_count(raw_frames, fps)
-    actual_duration = valid_frames / fps
-    return valid_frames, actual_duration
+    return valid_frames, valid_frames / fps
 
 def get_chunk_seed(global_seed: int, chunk_index: int) -> int:
-    """Deterministic per-chunk seed derived from global seed and chunk index."""
     return (global_seed + chunk_index * 1000003) & 0x7FFFFFFF
 
 def plan_chunks(total_frames: int, chunk_size: int, fps: int) -> List[Dict]:
-    """
-    Divide total_frames into valid LTX chunks.
-    Each chunk overlaps the next by 1 frame for continuity.
-    Returns a list of chunk descriptor dicts.
-    """
-    chunks = []
-    start = 0
-    idx = 0
+    chunks = []; start = 0; idx = 0
     while start < total_frames:
         remaining = total_frames - start
-        raw_size = min(chunk_size, remaining)
-        # Ensure chunk is a valid LTX frame count
+        raw_size  = min(chunk_size, remaining)
         valid_size = normalize_ltx_frame_count(raw_size, fps)
-        # Don't exceed total
         if start + valid_size > total_frames:
             valid_size = total_frames - start
-            # Re-validate; if under min, absorb into previous chunk
             if valid_size < 9:
                 if chunks:
                     chunks[-1]["num_frames"] += valid_size
                 break
-        chunks.append({
-            "chunk_index": idx,
-            "start_frame": start,
-            "num_frames": valid_size,
-            "fps": fps,
-            "path": None,
-        })
-        idx += 1
-        start += valid_size
+        chunks.append({"chunk_index": idx,"start_frame": start,
+                        "num_frames": valid_size,"fps": fps,"path": None})
+        idx += 1; start += valid_size
     return chunks
 
 def estimate_chunk_size(w: int, h: int, fps: int, mode: str = "t4_safe") -> int:
-    """
-    Estimate a safe chunk size for the given resolution and quality mode.
-    Uses free VRAM and a simple memory model:
-        latent_bytes ≈ (W/8) * (H/8) * frames * 128 channels * 2 bytes (bf16) * 2 (video+audio)
-    Returns a valid LTX frame count.
-    """
     profile = T4_PROFILES.get(mode, T4_PROFILES["t4_safe"])
     if not CONFIG["auto_chunk_size"]:
         return normalize_ltx_frame_count(profile["chunk_frames"])
-
-    free_gb = mem.gpu_free_gb() - CONFIG["gpu_safety_margin_gb"]
-    free_gb = max(free_gb, 1.0)
+    free_gb    = max(1.0, mem.gpu_free_gb() - CONFIG["gpu_safety_margin_gb"])
     free_bytes = free_gb * (1024 ** 3)
-
-    lw = w // 8
-    lh = h // 8
-    bytes_per_frame = lw * lh * 128 * 2 * 2  # bf16, video+audio channels
+    lw = w // 8; lh = h // 8
+    bytes_per_frame = lw * lh * 128 * 2 * 2
     max_frames = int(free_bytes / bytes_per_frame)
     max_frames = max(9, min(max_frames, profile["chunk_frames"]))
-
     safe_frames = normalize_ltx_frame_count(max_frames, fps)
-    print(f"  Auto chunk size: {safe_frames} frames  (estimated from {free_gb:.2f} GB free)")
+    print(f"  Auto chunk size: {safe_frames} frames ({free_gb:.2f} GB free)")
     return safe_frames
-
 
 # =============================================================================
 # SECTION 10 — RESOLUTION & PROFILE SELECTION
 # =============================================================================
 
 def select_profile(mode: str) -> Dict:
-    """Return the T4 profile dict for the given mode."""
     if mode not in T4_PROFILES:
         print(f"  Unknown quality mode '{mode}', falling back to t4_safe.")
         mode = "t4_safe"
@@ -1178,38 +1230,15 @@ def select_profile(mode: str) -> Dict:
     return p
 
 def check_resolution_safety(w: int, h: int, mode: str) -> Tuple[int, int]:
-    """
-    Warn if the requested resolution exceeds safe T4 limits for the given mode.
-    If CONFIG['allow_auto_downgrade'] is True, automatically downgrades.
-    Returns the (final_w, final_h) to use.
-    """
     profile = select_profile(mode)
-    safe_w = profile["generation_width"]
-    safe_h = profile["generation_height"]
-
-    # Estimate VRAM needed for full-resolution single chunk
-    lw = w // 8
-    lh = h // 8
-    chunk_frames = profile["chunk_frames"]
-    est_bytes = lw * lh * 128 * 2 * 2 * chunk_frames
-    est_gb = est_bytes / (1024 ** 3)
-    free_gb = mem.gpu_free_gb()
-
+    safe_w = profile["generation_width"]; safe_h = profile["generation_height"]
     if w <= safe_w and h <= safe_h:
-        return w, h  # within profile limits
-
-    print(f"\n  Resolution check:")
-    print(f"    Requested  : {w}×{h}")
-    print(f"    Estimated T4 memory for {chunk_frames}-frame chunk: {est_gb:.2f} GB")
-    print(f"    Safe for {mode}: {safe_w}×{safe_h}")
-    print(f"    VRAM free now: {free_gb:.2f} GB")
-
+        return w, h
+    print(f"\n  Resolution check: {w}×{h} exceeds safe {safe_w}×{safe_h} for {mode}")
     if CONFIG["allow_auto_downgrade"]:
         print(f"  → Auto-downgrading to {safe_w}×{safe_h}")
         return safe_w, safe_h
-    else:
-        print(f"  → Proceeding with requested {w}×{h} (auto-downgrade disabled)")
-        return w, h
+    return w, h
 
 
 # =============================================================================
@@ -1217,383 +1246,260 @@ def check_resolution_safety(w: int, h: int, mode: str) -> Tuple[int, int]:
 # =============================================================================
 
 def tensor_width_height(image) -> Tuple[int, int]:
-    """
-    Return (width, height) for a ComfyUI image tensor (NHWC or HWC).
-    Replaces the deprecated GetImageSize custom node dependency.
-    """
     if isinstance(image, (tuple, list)):
         image = get_value_at_index(image, 0)
-    if image.ndim == 4:   # (N, H, W, C)
+    if image.ndim == 4:
         return int(image.shape[2]), int(image.shape[1])
-    if image.ndim == 3:   # (H, W, C)
+    if image.ndim == 3:
         return int(image.shape[1]), int(image.shape[0])
-    raise ValueError(f"Unsupported image tensor shape: {getattr(image, 'shape', None)}")
-
+    raise ValueError(f"Unsupported image tensor shape: {getattr(image,'shape',None)}")
 
 def load_input_image(image_path: Optional[str], width: int, height: int) -> Tuple:
-    """
-    Load and validate input image using ComfyUI LoadImage node.
-    Returns a (image_tensor, mask) tuple plus (image_strength, image_bypass).
-    For T2V (image_path=None) returns a grey placeholder tensor.
-    The master image tensor is kept on CPU; only transferred to GPU when needed.
-    """
     if image_path is not None:
-        loadimage = get_node("LoadImage")
-        loaded = loadimage.load_image(image=image_path)
-        image_strength = 1.0
-        image_bypass = False
+        loaded = get_node("LoadImage").load_image(image=image_path)
         print(f"  ✓ Input image loaded: {image_path}")
-    else:
-        # Text-to-video: grey placeholder (stays on CPU)
-        noise_image = torch.full((1, height, width, 3), 0.5, dtype=torch.float32)
-        loaded = (noise_image, None)
-        image_strength = 0.0
-        image_bypass = True
-        print("  ✓ T2V mode — using grey placeholder image")
-    return loaded, image_strength, image_bypass
+        return loaded, 1.0, False
+    noise_image = torch.full((1, height, width, 3), 0.5, dtype=torch.float32)
+    print("  ✓ T2V mode — grey placeholder")
+    return (noise_image, None), 0.0, True
 
-
-def prepare_image_for_chunk(
-    loaded_image_tuple,
-    width: int,
-    height: int,
-    img_compression: int = 18,
-    longer_edge: int = 1312,
-) -> Tuple:
-    """
-    Run the LTX image preprocessing pipeline for a single chunk.
-    Mirrors workflow nodes: ResizeImageMaskNode → ResizeImagesByLongerEdge → LTXVPreprocess
-    Returns (preprocessed_image, latent_w, latent_h).
-    The image tensor is created fresh each call so it can be released independently.
-    """
-    resizeimagemasknode = get_node("ResizeImageMaskNode")
+def prepare_image_for_chunk(loaded_image_tuple, width: int, height: int,
+                             img_compression: int = 18, longer_edge: int = 1312) -> Tuple:
+    resizeimagemasknode      = get_node("ResizeImageMaskNode")
     resizeimagesbylongeredge = get_node("ResizeImagesByLongerEdge")
-    ltxvpreprocess = get_node("LTXVPreprocess")
+    ltxvpreprocess           = get_node("LTXVPreprocess")
 
-    # Node 102 — ResizeImageMaskNode: scale to generation resolution
     resized = resizeimagemasknode.EXECUTE_NORMALIZED(
         input=get_value_at_index(loaded_image_tuple, 0),
         scale_method="lanczos",
-        resize_type={
-            "resize_type": "scale dimensions",
-            "width": width,
-            "height": height,
-            "crop": "center",
-        },
+        resize_type={"resize_type":"scale dimensions","width":width,"height":height,"crop":"center"},
     )
-
-    # Node 140 — ResizeImagesByLongerEdge: normalise longer edge
     rescaled = resizeimagesbylongeredge.EXECUTE_NORMALIZED(
-        longer_edge=longer_edge,
-        images=get_value_at_index(resized, 0),
-    )
-
-    # Node 126 — LTXVPreprocess: JPEG-style compression artifact (workflow: img_compression=18)
+        longer_edge=longer_edge, images=get_value_at_index(resized, 0))
     preprocessed = ltxvpreprocess.EXECUTE_NORMALIZED(
-        img_compression=img_compression,
-        image=get_value_at_index(rescaled, 0),
-    )
+        img_compression=img_compression, image=get_value_at_index(rescaled, 0))
 
-    # Compute latent spatial dimensions directly from resized tensor
     resized_w, resized_h = tensor_width_height(get_value_at_index(resized, 0))
     latent_w = max(1, resized_w // 2)
     latent_h = max(1, resized_h // 2)
 
-    # Release intermediate tensors immediately
     del resized, rescaled
-    mem.soft_cleanup()
-
+    mem.stage_cleanup("prepare_image_for_chunk")   # [MEM-5]
     return preprocessed, latent_w, latent_h
 
-
 def load_audio_file_lightweight(audio_path: Optional[str]) -> Optional[Dict]:
-    """
-    Load audio metadata without reading the full waveform into RAM.
-    Returns a lightweight dict for later use; waveform loaded on-demand per segment.
-    """
     if audio_path is None:
         return None
     if not os.path.exists(audio_path):
-        print(f"  ✗ Audio file not found: {audio_path}")
-        return None
-    size_mb = os.path.getsize(audio_path) / (1024 * 1024)
-    print(f"  ✓ Audio registered: {os.path.basename(audio_path)} ({size_mb:.1f} MB)")
-    return {
-        "path": audio_path,
-        "loaded": False,
-        "waveform": None,  # populated lazily
-        "sample_rate": None,
-    }
-
-
-def get_audio_segment_for_chunk(
-    audio_info: Optional[Dict],
-    start_frame: int,
-    num_frames: int,
-    fps: int,
-) -> Optional[Dict]:
-    """
-    Extract a lightweight audio segment dict for a temporal chunk.
-    Waveform is NOT duplicated; only start/length metadata is returned.
-    The actual audio is handled by LTXVEmptyLatentAudio (model hallucinates audio)
-    or injected via ComfyUI audio nodes when a real audio file is provided.
-    """
-    if audio_info is None:
-        return None
-    start_s = start_frame / fps
-    duration_s = num_frames / fps
-    return {
-        "path": audio_info["path"],
-        "start_seconds": start_s,
-        "duration_seconds": duration_s,
-        "trim_frame": start_frame,
-    }
-
+        print(f"  ✗ Audio not found: {audio_path}"); return None
+    size_mb = os.path.getsize(audio_path) / (1024*1024)
+    print(f"  ✓ Audio: {os.path.basename(audio_path)} ({size_mb:.1f} MB)")
+    return {"path": audio_path, "loaded": False, "waveform": None, "sample_rate": None}
 
 # =============================================================================
-# SECTION 12 — TEXT CONDITIONING (with embedding cache)
+# SECTION 12 — TEXT CONDITIONING  (embedding cache)
 # =============================================================================
 
-# CPU-resident conditioning cache: avoids re-encoding identical prompts
 _CONDITIONING_CACHE: Dict[str, Any] = {}
 
-
-def build_text_conditioning(
-    prompt: str,
-    fps: int,
-    cache_key: Optional[str] = None,
-) -> Tuple:
-    """
-    Encode text prompt using DualCLIPLoader (workflow node 12) then wrap it
-    in LTXVConditioning (node 27) to inject frame rate metadata.
-
-    Returns (positive_cond, negative_cond) both on CPU.
-    The CLIP model is unloaded immediately after encoding.
-    Embeddings are cached by cache_key so identical prompts reuse the result.
-    """
+def build_text_conditioning(prompt: str, fps: int, cache_key: Optional[str] = None) -> Tuple:
     ck = cache_key or hashlib.md5(f"{prompt}|{fps}".encode()).hexdigest()
-
     if ck in _CONDITIONING_CACHE:
         print("  ✓ Conditioning from cache.")
         return _CONDITIONING_CACHE[ck]
 
     print("  Loading text encoder (DualCLIPLoader)...")
+    mem.pre_op_guard("DualCLIPLoader", required_gb=4.0)   # [MEM-6]
     dualcliploader = get_node("DualCLIPLoader")
-
-    # Primary: gemma_3_12B_it_fp4_mixed + ltx-2.3_text_projection_bf16 (workflow node 12)
     try:
         clip_result = dualcliploader.load_clip(
-            clip_name1=MODELS["text_encoder_1"],
-            clip_name2=MODELS["text_encoder_2"],
-            type="ltxv",
-            device="default",
-        )
+            clip_name1=MODELS["text_encoder_1"], clip_name2=MODELS["text_encoder_2"],
+            type="ltxv", device="default")
     except Exception as e:
-        print(f"  Primary CLIP load failed ({e}), trying fp8 fallback...")
-        # Fallback: fp8 Gemma variant used in experiment_ltx23.py
+        print(f"  Primary CLIP failed ({e}), trying fp8 fallback...")
         clip_result = dualcliploader.load_clip(
             clip_name1="gemma_3_12B_it_fp8_scaled.safetensors",
             clip_name2="ltx-2.3-22b-dev_embeddings_connectors.safetensors",
-            type="ltxv",
-            device="default",
-        )
-
+            type="ltxv", device="default")
     clip_obj = get_value_at_index(clip_result, 0)
 
-    # Encode positive prompt
-    cliptextencode = get_node("CLIPTextEncode")
-    pos_encoded = cliptextencode.encode(text=prompt, clip=clip_obj)
-
-    # Null negative (workflow node 128 — ConditioningZeroOut)
+    cliptextencode   = get_node("CLIPTextEncode")
+    pos_encoded      = cliptextencode.encode(text=prompt, clip=clip_obj)
     conditioningzeroout = get_node("ConditioningZeroOut")
-    neg_encoded = conditioningzeroout.zero_out(
-        conditioning=get_value_at_index(pos_encoded, 0)
-    )
+    neg_encoded      = conditioningzeroout.zero_out(
+        conditioning=get_value_at_index(pos_encoded, 0))
 
-    # Unload CLIP immediately — it is the single biggest RAM consumer after the DiT
+    # Immediately free ~6 GB CLIP from VRAM
     del clip_result, clip_obj, dualcliploader, cliptextencode
-    mem.cleanup()
+    mem.aggressive_cleanup()                               # [MEM-5] full sweep after CLIP unload
+    print_vram_usage("  ")                                 # [MEM-6] show VRAM after CLIP release
 
-    # LTXVConditioning (workflow node 27): inject frame rate into conditioning
     ltxvconditioning = get_node("LTXVConditioning")
     cond = ltxvconditioning.EXECUTE_NORMALIZED(
         frame_rate=fps,
         positive=get_value_at_index(pos_encoded, 0),
         negative=get_value_at_index(neg_encoded, 0),
     )
-
-    # Move conditioning to CPU for caching
     pos_cond = get_value_at_index(cond, 0)
     neg_cond = get_value_at_index(cond, 1)
-
-    result = (pos_cond, neg_cond)
+    result   = (pos_cond, neg_cond)
     _CONDITIONING_CACHE[ck] = result
     print("  ✓ Text conditioning built and cached.")
 
     del pos_encoded, neg_encoded, cond
-    mem.cleanup()
-
+    mem.stage_cleanup("build_text_conditioning")           # [MEM-5]
     return result
 
 
-def get_conditioning_on_device(pos_cond, neg_cond):
-    """
-    Return conditioning already on CUDA (no-op if already there).
-    For use immediately before sampler calls.
-    """
-    return pos_cond, neg_cond
-
-
 # =============================================================================
-# SECTION 13 — MODEL LOADING (DiT, VAEs, Upscaler, LoRAs)
+# SECTION 13 — MODEL LOADING  (DiT, VAEs, Upscaler, LoRAs)
 # =============================================================================
 
-# Weak model references to avoid accidental duplication
-_MODEL_CACHE: Dict[str, Any] = {}
-
-
-# ── DiT model cache (prevents double-load OOM on T4) ─────────────────────────
-_DIT_MODEL_CACHE = None
-
+_DIT_MODEL_CACHE = None   # module-level fallback when ModelCache is disabled
 
 def load_dit_model(apply_loras: bool = True) -> Any:
     """
-    Load the LTX-2.3 22B GGUF DiT model (workflow node 135 - UnetLoaderGGUF)
-    and apply all 4 LoRAs at workflow strengths.
-
-    Uses a module-level cache so subsequent calls within the same chunk reuse
-    the already-loaded model instead of allocating a second 12-13 GB copy.
-
-    LoRA application order (from JSON PowerLoraLoader node):
-        1. lora_distilled  strength=0.4
-        2. lora_omninft    strength=0.6
-        3. lora_transition strength=0.7
-        4. lora_mvcamera   strength=0.9
+    [MEM-2] Load DiT via ModelCache when enabled, else module cache.
+    [MEM-3] Uses validate_lora_exists() for safe LoRA path resolution.
+    Forces LoRAs off when profile sets disable_all_loras=True (ultra_safe).
     """
     global _DIT_MODEL_CACHE
-    if _DIT_MODEL_CACHE is not None:
-        print("  DiT model (from cache)")
-        return _DIT_MODEL_CACHE
 
-    print("  Loading DiT model (UnetLoaderGGUF)...")
-    mem.cleanup()
+    active_profile = T4_PROFILES.get(CONFIG["quality_mode"], {})
+    force_no_loras = active_profile.get("disable_all_loras", False)
 
-    unetloadergguf = get_node("UnetLoaderGGUF")
-    unet_result = unetloadergguf.load_unet(unet_name=MODELS["dit"])
-    model = get_value_at_index(unet_result, 0)
-    del unet_result
-    mem.soft_cleanup()
+    def _load():
+        global _DIT_MODEL_CACHE
+        if _DIT_MODEL_CACHE is not None:
+            return _DIT_MODEL_CACHE
+        print("  Loading DiT model (UnetLoaderGGUF)...")
+        mem.pre_op_guard("UnetLoaderGGUF", required_gb=1.0)  # [MEM-6]
+        mem.cleanup()
+        unetloadergguf = get_node("UnetLoaderGGUF")
+        model = get_value_at_index(unetloadergguf.load_unet(unet_name=MODELS["dit"]), 0)
+        mem.stage_cleanup("UnetLoaderGGUF load")              # [MEM-5]
 
-    if apply_loras:
-        # Import LoraLoaderModelOnly from ComfyUI nodes
-        from nodes import LoraLoaderModelOnly
-        lora_loader = LoraLoaderModelOnly()
+        if apply_loras and not force_no_loras:
+            from nodes import LoraLoaderModelOnly
+            lora_loader = LoraLoaderModelOnly()
+            lora_order = [
+                ("lora_distilled",  LORA_STRENGTHS["lora_distilled"]),
+                ("lora_omninft",    LORA_STRENGTHS["lora_omninft"]),
+                ("lora_transition", LORA_STRENGTHS["lora_transition"]),
+                ("lora_mvcamera",   LORA_STRENGTHS["lora_mvcamera"]),
+            ]
+            for lora_key, strength in lora_order:
+                if not LORA_ENABLED.get(lora_key, True):
+                    print(f"  LoRA disabled (VRAM save): {MODELS[lora_key]}")
+                    continue
+                # [MEM-3] validate_lora_exists for safe resolution
+                lora_path = validate_lora_exists(MODELS[lora_key], "DiT")
+                if lora_path:
+                    print(f"  Applying LoRA: {MODELS[lora_key]}  strength={strength}")
+                    model = lora_loader.load_lora_model_only(model, MODELS[lora_key], strength)[0]
+                    mem.stage_cleanup(f"LoRA {lora_key}")     # [MEM-5] after every LoRA merge
+                else:
+                    print(f"  LoRA not found, skipping: {MODELS[lora_key]}")
+        elif force_no_loras:
+            print("  [ultra_safe] All LoRAs disabled to maximise free VRAM.")
+        _DIT_MODEL_CACHE = model
+        print("  DiT model ready.")
+        print_vram_usage("  ")                                 # [MEM-6] VRAM bar after DiT load
+        return model
 
-        lora_order = [
-            ("lora_distilled",  LORA_STRENGTHS["lora_distilled"]),
-            ("lora_omninft",    LORA_STRENGTHS["lora_omninft"]),
-            ("lora_transition", LORA_STRENGTHS["lora_transition"]),
-            ("lora_mvcamera",   LORA_STRENGTHS["lora_mvcamera"]),
-        ]
-        skipped_for_vram = []
-        for lora_key, strength in lora_order:
-            fname = MODELS[lora_key]
-            if not LORA_ENABLED.get(lora_key, True):
-                print(f"  LoRA disabled (VRAM save), skipping: {fname}")
-                skipped_for_vram.append(fname)
-                continue
-            lora_path = os.path.join(MODEL_DEST_DIRS[lora_key], fname)
-            if os.path.exists(lora_path):
-                print(f"  Applying LoRA: {fname}  strength={strength}")
-                model = lora_loader.load_lora_model_only(model, fname, strength)[0]
-                mem.soft_cleanup()
-            else:
-                print(f"  LoRA not found, skipping: {fname}")
-        if skipped_for_vram:
-            print(f"  ↓ Skipped {len(skipped_for_vram)} LoRA(s) to save VRAM: "
-                  f"{', '.join(skipped_for_vram)}")
+    if MODEL_CACHE is not None:
+        return MODEL_CACHE.get_unet(_load)
+    return _load()
 
-    _DIT_MODEL_CACHE = model
-    print("  DiT model ready.")
-    return model
+def _clear_comfy_model_cache():
+    """
+    BUG-E FIX: Clear ComfyUI's internal model_management cache.
+
+    ComfyUI wraps every loaded model in a ModelPatcher and appends it to
+    `comfy.model_management.current_loaded_models`.  As long as that list
+    holds a reference the Python refcount stays > 0, so gc.collect() +
+    empty_cache() can never free the VRAM — exactly what we saw in the log
+    (VRAM stayed at 13 GB after release_dit_model()).
+
+    We call unload_all_models() which moves all models to CPU and removes
+    them from the list, dropping refcount to 0 so the next gc sweep actually
+    frees the GPU tensors.
+    """
+    try:
+        import comfy.model_management as mm
+        mm.unload_all_models()          # moves models to CPU, clears internal list
+        mm.soft_empty_cache()           # comfy's own empty_cache wrapper
+        print("  [comfy] model_management cache cleared.")
+    except Exception as e:
+        print(f"  [comfy] Could not clear model_management cache: {e}")
 
 
 def release_dit_model():
-    """Clear the DiT model cache and free GPU memory."""
+    """
+    BUG-B FIX: aggressive_cleanup was only called when _DIT_MODEL_CACHE was
+    not None — which is NEVER true when USE_MODEL_CACHE=True (the model lives
+    in MODEL_CACHE._unet, not _DIT_MODEL_CACHE).  The biggest sweep of the
+    chunk therefore silently never ran.
+
+    Fix: call _clear_comfy_model_cache() then mem.aggressive_cleanup()
+    unconditionally, regardless of which cache path was used.
+    """
     global _DIT_MODEL_CACHE
+    # Step 1 — drop our own Python references
+    if MODEL_CACHE is not None:
+        MODEL_CACHE.evict_unet()            # explicit del + aggressive_cleanup (Bug-A fix)
     if _DIT_MODEL_CACHE is not None:
         del _DIT_MODEL_CACHE
         _DIT_MODEL_CACHE = None
-        mem.aggressive_cleanup()
-        print("  DiT model released from cache.")
-
+    # Step 2 — clear ComfyUI's internal ModelPatcher references (Bug-E fix)
+    _clear_comfy_model_cache()
+    # Step 3 — unconditional aggressive sweep (Bug-B fix: was behind dead branch)
+    mem.aggressive_cleanup()
+    print("  DiT model released.")
+    print_vram_usage("  ")              # confirm VRAM actually dropped
 
 def load_video_vae() -> Any:
-    """Load video VAE (workflow node 36 — VAELoader)."""
-    print("  Loading video VAE...")
-    vaeloader = get_node("VAELoader")
-    result = vaeloader.load_vae(vae_name=MODELS["video_vae"])
-    vae = get_value_at_index(result, 0)
-    del result
-    return vae
-
+    def _load():
+        print("  Loading video VAE...")
+        vaeloader = get_node("VAELoader")
+        vae = get_value_at_index(vaeloader.load_vae(vae_name=MODELS["video_vae"]), 0)
+        mem.stage_cleanup("video_vae load")                    # [MEM-5]
+        return vae
+    if MODEL_CACHE is not None:
+        return MODEL_CACHE.get_video_vae(_load)
+    return _load()
 
 def load_audio_vae() -> Any:
-    """
-    Load audio VAE with version-resilient fallback
-    (workflow node 8 — VAELoader / VAELoaderKJ).
-    """
-    print("  Loading audio VAE...")
-    from nodes import NODE_CLASS_MAPPINGS
-
-    if "VAELoaderKJ" in NODE_CLASS_MAPPINGS:
-        loader = NODE_CLASS_MAPPINGS["VAELoaderKJ"]()
-        result = loader.load_vae(
-            vae_name=MODELS["audio_vae"],
-            device="main_device",
-            weight_dtype="fp16",
-        )
-    elif "VAELoader" in NODE_CLASS_MAPPINGS:
-        loader = NODE_CLASS_MAPPINGS["VAELoader"]()
-        result = loader.load_vae(vae_name=MODELS["audio_vae"])
-    else:
-        raise KeyError("No compatible audio VAE loader found (VAELoaderKJ or VAELoader).")
-
-    vae = get_value_at_index(result, 0)
-    del result
-    return vae
-
-
-def load_tiny_vae() -> Any:
-    """
-    Load Tiny VAE for fast preview thumbnails
-    (workflow node 6 — VAELoaderKJ titled 'Tiny VAELoader KJ').
-    """
-    print("  Loading Tiny VAE (preview)...")
-    from nodes import NODE_CLASS_MAPPINGS
-    if "VAELoaderKJ" in NODE_CLASS_MAPPINGS:
-        loader = NODE_CLASS_MAPPINGS["VAELoaderKJ"]()
-        result = loader.load_vae(
-            vae_name=MODELS["tiny_vae"],
-            device="main_device",
-            weight_dtype="bf16",
-        )
-        return get_value_at_index(result, 0)
-    return None
-
+    def _load():
+        print("  Loading audio VAE...")
+        from nodes import NODE_CLASS_MAPPINGS
+        if "VAELoaderKJ" in NODE_CLASS_MAPPINGS:
+            loader = NODE_CLASS_MAPPINGS["VAELoaderKJ"]()
+            result = loader.load_vae(vae_name=MODELS["audio_vae"],
+                                     device="main_device", weight_dtype="fp16")
+        else:
+            loader = NODE_CLASS_MAPPINGS["VAELoader"]()
+            result = loader.load_vae(vae_name=MODELS["audio_vae"])
+        vae = get_value_at_index(result, 0)
+        mem.stage_cleanup("audio_vae load")                    # [MEM-5]
+        return vae
+    if MODEL_CACHE is not None:
+        return MODEL_CACHE.get_audio_vae(_load)
+    return _load()
 
 def load_upscaler_model() -> Any:
-    """Load latent upscale model (workflow node 13 — LatentUpscaleModelLoader)."""
-    print("  Loading spatial upscaler...")
-    loader = get_node("LatentUpscaleModelLoader")
-    result = loader.EXECUTE_NORMALIZED(model_name=MODELS["upscaler"])
-    upscaler = get_value_at_index(result, 0)
-    del result
-    return upscaler
-
+    def _load():
+        print("  Loading spatial upscaler...")
+        loader  = get_node("LatentUpscaleModelLoader")
+        result  = loader.EXECUTE_NORMALIZED(model_name=MODELS["upscaler"])
+        upscaler = get_value_at_index(result, 0)
+        mem.stage_cleanup("upscaler load")                     # [MEM-5]
+        return upscaler
+    if MODEL_CACHE is not None:
+        return MODEL_CACHE.get_upscaler(_load)
+    return _load()
 
 def offload_model(model, name: str = "model"):
-    """Move a model to CPU to free VRAM, then run cleanup."""
     if model is not None and hasattr(model, "to"):
         try:
             model.to("cpu")
@@ -1604,579 +1510,274 @@ def offload_model(model, name: str = "model"):
 
 
 # =============================================================================
-# SECTION 14 — DIRECTOR WORKFLOW EXECUTION (core pipeline)
-# =============================================================================
-#
-# This section reproduces the LTX-2.3 Director 2.0 computational graph:
-#
-#  LTXDirector (node 131)
-#      → LTXVConditioning (node 27) + ConditioningZeroOut (node 128)
-#      → LTXVConditioning wrapped conditioning
-#      → LTXVEmptyLatentAudio (audio latent)
-#      → LTXVImgToVideoInplace (image guidance into latent)
-#      → LTXVConcatAVLatent (node 29) — pass 1 concat
-#      → LTXDirectorGuide (node 133) — pass 1 guide
-#      → CFGGuider (node 28)
-#      → SamplerCustomAdvanced (node 31) — pass 1 sample
-#      → LTXVSeparateAVLatent (node 34) — split
-#      → LTXDirectorCropGuides (node 55) — crop for upscale
-#      → LTXVLatentUpsampler (node 14) — 2× spatial upsample
-#      → LTXDirectorGuide (node 132) — pass 2 guide
-#      → LTXVConcatAVLatent (node 18) — pass 2 concat
-#      → CFGGuider (node 17)
-#      → SamplerCustomAdvanced (node 19) — pass 2 refinement
-#      → LTXVSeparateAVLatent (node 22) — split final
-#
+# SECTION 14 — DIRECTOR WORKFLOW EXECUTION
 # =============================================================================
 
-def build_director_conditioning(
-    pos_cond,
-    neg_cond,
-    image_path: Optional[str],
-    audio_path: Optional[str],
-    num_frames: int,
-    fps: int,
-    width: int,
-    height: int,
-    segment_images: Optional[List[str]] = None,
-    segment_prompts: Optional[List[str]] = None,
-    dit_model=None,
-    audio_vae=None,
-) -> Tuple:
-    """
-    Run the LTXDirector node (workflow node 131) when available.
-    This is the WhatDreamsCost Director node that builds multi-segment timeline
-    conditioning with image, audio and motion guide data.
-
-    LTXDirector outputs (per workflow JSON):
-        slot 0: model (passthrough/modified DiT)
-        slot 1: positive conditioning
-        slot 2: video_latent (replaces EmptyLTXVLatentVideo)
-        slot 3: audio_latent (replaces LTXVEmptyLatentAudio)
-        slot 4: guide_data
-        slot 5: motion_guide_data
-        slot 6: frame_rate
-
-    If LTXDirector is not available in NODE_CLASS_MAPPINGS, falls back gracefully
-    to standard LTX conditioning (single-image path) and logs the missing node.
-
-    Returns:
-        (director_model, positive_cond, video_latent, audio_latent,
-         guide_data, motion_guide_data, frame_rate)
-    """
+def build_director_conditioning(pos_cond, neg_cond, image_path, audio_path,
+                                  num_frames, fps, width, height,
+                                  dit_model=None, audio_vae=None) -> Tuple:
     from nodes import NODE_CLASS_MAPPINGS
-
-    # -- T4 memory guard: skip LTXDirector entirely in t4_safe mode --
-    # LTXDirector requires loading CLIP (Gemma 3 12B ~6GB) alongside the DiT model.
-    # On T4 (15GB VRAM, ~12.7GB RAM), after DiT + 4 LoRAs load (~14.15GB GPU),
-    # there is physically no room for CLIP. Skip Director and use fallback path
-    # which only needs DiT (already loaded/cached) + audio_vae (small, ~0.5GB).
-    active_profile = T4_PROFILES.get(QUALITY_MODE, {})
+    active_profile = T4_PROFILES.get(CONFIG["quality_mode"], {})
     if active_profile.get("skip_director", False):
-        print("  Skipping LTXDirector (t4_safe mode) -- CLIP would exceed RAM.")
-        print("  Using fallback conditioning (no CLIP needed).")
+        print("  Skipping LTXDirector (profile skip_director=True).")
         return _build_director_fallback(pos_cond, neg_cond, num_frames, fps,
                                         dit_model=dit_model, audio_vae=audio_vae,
-                                        reason="t4_safe mode - CLIP skipped")
+                                        reason="profile skip")
 
-    # -- LTXDirector path (WhatDreamsCost) --
     if "LTXDirector" in NODE_CLASS_MAPPINGS:
         print("  Using LTXDirector (WhatDreamsCost) node...")
-
-        # Load models needed by Director (reuse if already loaded)
         if dit_model is None:
             dit_model = load_dit_model(apply_loras=True)
         if audio_vae is None:
             audio_vae = load_audio_vae()
 
-        # Load CLIP via DualCLIPLoader (same as build_text_conditioning, workflow node 12)
-        # NOTE: The workflow routes CLIP through Power Lora Loader (node 138) before
-        # LTXDirector (node 131). However, all LoRAs in this pipeline are model-only
-        # (distilled, transition, mvcamera, omninft) and do not modify CLIP weights.
-        # LoraLoaderModelOnly is used for the DiT, which by design does not touch CLIP.
-        # Therefore passing raw CLIP here is correct and matches the effective behavior.
+        mem.pre_op_guard("DualCLIPLoader (Director)", required_gb=4.0)  # [MEM-6]
         dualcliploader = get_node("DualCLIPLoader")
         try:
             clip_result = dualcliploader.load_clip(
-                clip_name1=MODELS["text_encoder_1"],
-                clip_name2=MODELS["text_encoder_2"],
-                type="ltxv",
-                device="default",
-            )
+                clip_name1=MODELS["text_encoder_1"], clip_name2=MODELS["text_encoder_2"],
+                type="ltxv", device="default")
         except Exception as e:
-            print(f"  Primary CLIP load failed ({e}), trying fp8 fallback...")
+            print(f"  Primary CLIP failed ({e}), fp8 fallback...")
             clip_result = dualcliploader.load_clip(
                 clip_name1="gemma_3_12B_it_fp8_scaled.safetensors",
                 clip_name2="ltx-2.3-22b-dev_embeddings_connectors.safetensors",
-                type="ltxv",
-                device="default",
-            )
+                type="ltxv", device="default")
         clip_model = get_value_at_index(clip_result, 0)
 
         director_cls = NODE_CLASS_MAPPINGS["LTXDirector"]
-        director = director_cls()
-
-        # Introspect INPUT_TYPES to discover what the execute function accepts.
-        # This is the safe ComfyUI pattern: only pass params the node declares.
+        director     = director_cls()
         try:
             input_types = director_cls.INPUT_TYPES()
         except Exception:
             input_types = {"required": {}, "optional": {}}
-        required_params = set(input_types.get("required", {}).keys())
-        optional_params = set(input_types.get("optional", {}).keys())
-        all_accepted = required_params | optional_params
+        all_accepted = set(input_types.get("required", {}).keys()) | set(input_types.get("optional", {}).keys())
 
-        # Core inputs (from workflow JSON node 131 linked inputs)
-        director_kwargs = dict(
-            model=dit_model,
-            audio_vae=audio_vae,
-            global_prompt=GLOBAL_PROMPT,
+        duration_s   = num_frames / fps
+        director_kwargs = dict(model=dit_model, audio_vae=audio_vae, global_prompt=GLOBAL_PROMPT)
+        if not all_accepted or "clip" in all_accepted:
+            director_kwargs["clip"] = clip_model
+
+        widget_defaults = {
+            "start_second": 0, "end_second": duration_s, "duration_seconds": duration_s,
+            "start_frame": 0,  "end_frame": num_frames,  "duration_frames": num_frames,
+            "timeline_data": json.dumps({
+                "mainTrackEnabled":True,"audioTrackEnabled":True,"motionTrackEnabled":True,
+                "global_prompt":GLOBAL_PROMPT,"retakeMode":False,
+                "normalStartFrame":0,"normalDurationFrames":num_frames,
+                "segments":[],"motionSegments":[],"audioSegments":[],
+            }),
+            "local_prompts":"","segment_lengths":"","epsilon":0.001,
+            "guide_strength":"1.00","frame_rate":fps,
+            "custom_width":width,"custom_height":height,
+            "resize_method":"maintain aspect ratio","divisible_by":32,
+            "img_compression":WORKFLOW_IMG_COMPRESSION,"retakeMode":False,"timeline_ui":"",
+        }
+        for k, v in widget_defaults.items():
+            if k in all_accepted:
+                director_kwargs[k] = v
+        if not all_accepted:
+            for k in ["start_second","end_second","duration_seconds",
+                      "start_frame","end_frame","duration_frames",
+                      "timeline_data","local_prompts","segment_lengths"]:
+                director_kwargs.setdefault(k, widget_defaults[k])
+
+        try:
+            fn = getattr(director_cls, "FUNCTION", None)
+            director_out = getattr(director, fn)(**director_kwargs) if fn else director.EXECUTE_NORMALIZED(**director_kwargs)
+        except (TypeError, AttributeError) as e:
+            print(f"  LTXDirector failed ({e}) — fallback.")
+            del clip_result, clip_model
+            mem.aggressive_cleanup()                           # [MEM-5]
+            return _build_director_fallback(pos_cond, neg_cond, num_frames, fps,
+                                            dit_model=dit_model, audio_vae=audio_vae,
+                                            reason=f"call failed: {e}")
+
+        del clip_result, clip_model
+        mem.aggressive_cleanup()                               # [MEM-5] free CLIP after Director
+        print_vram_usage("  ")                                 # [MEM-6]
+
+        return (
+            get_value_at_index(director_out, 0),
+            get_value_at_index(director_out, 1),
+            get_value_at_index(director_out, 2),
+            get_value_at_index(director_out, 3),
+            get_value_at_index(director_out, 4) if len(director_out) > 4 else None,
+            get_value_at_index(director_out, 5) if len(director_out) > 5 else None,
+            get_value_at_index(director_out, 6) if len(director_out) > 6 else fps,
         )
 
-        # Add CLIP if the node accepts it (CLIP is a linked input in the workflow)
-        if clip_model is not None:
-            if not all_accepted or "clip" in all_accepted:
-                director_kwargs["clip"] = clip_model
-
-        # Widget values (from workflow JSON node 131 widgets_values).
-        # These are required positional args for the execute() function.
-        # Compute from current chunk parameters for correctness.
-        total_frames = num_frames
-        duration_s = total_frames / fps
-        widget_defaults = {
-            "start_second": 0,
-            "end_second": duration_s,
-            "duration_seconds": duration_s,
-            "start_frame": 0,
-            "end_frame": total_frames,
-            "duration_frames": total_frames,
-            "timeline_data": json.dumps({
-                "mainTrackEnabled": True,
-                "audioTrackEnabled": True,
-                "motionTrackEnabled": True,
-                "propHeight": 90,
-                "globalPropHeight": 470,
-                "showFilenames": True,
-                "overrideAudio": False,
-                "inpaint_audio": True,
-                "global_prompt": GLOBAL_PROMPT,
-                "retake_global_prompt": "",
-                "retakeMode": False,
-                "retakeStart": 24,
-                "retakeLength": 48,
-                "retakePrompt": "",
-                "retakeStrength": 1,
-                "retakeVideo": None,
-                "normalStartFrame": 0,
-                "normalDurationFrames": total_frames,
-                "segments": [],
-                "motionSegments": [],
-                "audioSegments": [],
-            }),
-            "local_prompts": "",
-            "segment_lengths": "",
-            "epsilon": 0.001,
-            "guide_strength": "1.00",
-            "mainTrackEnabled": True,
-            "audioTrackEnabled": True,
-            "motionTrackEnabled": True,
-            "frame_rate": fps,
-            "display_mode": "seconds",
-            "custom_width": width,
-            "custom_height": height,
-            "resize_method": "maintain aspect ratio",
-            "divisible_by": 32,
-            "img_compression": WORKFLOW_IMG_COMPRESSION,
-            "retakeMode": False,
-            "timeline_ui": "",
-        }
-
-        # Only add widget params that the node actually accepts
-        for param_name, default_val in widget_defaults.items():
-            if param_name in all_accepted:
-                director_kwargs[param_name] = default_val
-
-        # If introspection found no params (fallback), add the 9 required ones
-        # that the error message told us about
-        if not all_accepted:
-            for param_name in ["start_second", "end_second", "duration_seconds",
-                               "start_frame", "end_frame", "duration_frames",
-                               "timeline_data", "local_prompts", "segment_lengths"]:
-                if param_name not in director_kwargs:
-                    director_kwargs[param_name] = widget_defaults[param_name]
-
-        # WhatDreamsCost custom nodes define their execution function name via
-        # the FUNCTION class attribute (standard ComfyUI pattern). Use that
-        # instead of EXECUTE_NORMALIZED which only exists on core nodes.
-        try:
-            func_name = getattr(director_cls, "FUNCTION", None)
-            if func_name:
-                func = getattr(director, func_name)
-                director_out = func(**director_kwargs)
-            else:
-                # Last resort: try EXECUTE_NORMALIZED (core nodes)
-                director_out = director.EXECUTE_NORMALIZED(**director_kwargs)
-        except (TypeError, AttributeError) as e:
-            print(f"  LTXDirector call failed ({e}) -- using fallback conditioning.")
-            return _build_director_fallback(pos_cond, neg_cond, num_frames, fps,
-                                           dit_model=dit_model, audio_vae=audio_vae,
-                                           reason=f"call failed: {e}")
-
-        # Extract all outputs per workflow node 131 output slots
-        dir_model       = get_value_at_index(director_out, 0)
-        dir_positive    = get_value_at_index(director_out, 1)
-        dir_video_lat   = get_value_at_index(director_out, 2)
-        dir_audio_lat   = get_value_at_index(director_out, 3)
-        dir_guide_data  = get_value_at_index(director_out, 4) if len(director_out) > 4 else None
-        dir_motion_data = get_value_at_index(director_out, 5) if len(director_out) > 5 else None
-        dir_frame_rate  = get_value_at_index(director_out, 6) if len(director_out) > 6 else fps
-
-        return (dir_model, dir_positive, dir_video_lat, dir_audio_lat,
-                dir_guide_data, dir_motion_data, dir_frame_rate)
-
-    # -- Fallback: standard conditioning (no LTXDirector node) --
     return _build_director_fallback(pos_cond, neg_cond, num_frames, fps,
                                     dit_model=dit_model, audio_vae=audio_vae)
 
-
-def _build_director_fallback(pos_cond, neg_cond, num_frames: int, fps: int,
-                             dit_model=None, audio_vae=None,
-                             reason: str = "not found") -> Tuple:
-    """
-    Fallback when LTXDirector is not available or intentionally skipped.
-    Returns the same tuple shape as build_director_conditioning but with
-    None for guide_data, motion_guide_data, and generates empty audio latent.
-
-    Accepts optional dit_model and audio_vae to avoid redundant loads when
-    the caller (e.g. generate_chunk) has already loaded these models.
-
-    Args:
-        reason: Why fallback is used (e.g. "not found", "t4_safe mode skip").
-    """
-    print(f"  LTXDirector fallback ({reason}) -- using standard conditioning.")
+def _build_director_fallback(pos_cond, neg_cond, num_frames, fps,
+                              dit_model=None, audio_vae=None, reason="not found") -> Tuple:
+    print(f"  LTXDirector fallback ({reason}).")
     if dit_model is None:
         dit_model = load_dit_model(apply_loras=True)
-    else:
-        print("  Reusing pre-loaded DiT model (no double-load).")
     if audio_vae is None:
         audio_vae = load_audio_vae()
-    else:
-        print("  Reusing pre-loaded audio VAE.")
-
     ltxvemptylatentaudio = get_node("LTXVEmptyLatentAudio")
     audio_lat = ltxvemptylatentaudio.EXECUTE_NORMALIZED(
-        frames_number=num_frames,
-        frame_rate=fps,
-        batch_size=1,
-        audio_vae=audio_vae,
-    )
-
-    # Return: model, positive, video_latent(None=use empty), audio_latent, guide, motion, fps
+        frames_number=num_frames, frame_rate=fps, batch_size=1, audio_vae=audio_vae)
+    mem.stage_cleanup("director_fallback")                     # [MEM-5]
     return dit_model, pos_cond, None, get_value_at_index(audio_lat, 0), None, None, fps
 
 
-def run_director_guide(
-    pos_cond,
-    neg_cond,
-    video_vae,
-    latent,
-    guide_data,
-    motion_guide_data,
-    model,
-    upscale_factor: float = 1.0,
-    node_id: str = "pass",
-) -> Tuple:
-    """
-    Run LTXDirectorGuide (workflow nodes 132 / 133).
-    Workflow node 133 (pass 1): upscale_factor=0.5
-    Workflow node 132 (pass 2): upscale_factor=1.0
-
-    Widget order: retake_image, upscale_factor_pass, upscale_factor, interpolation,
-                  blend_radius, crop_method, use_tiling, tile_overlap, tile_size,
-                  tile_stride, force_inpaint.
-    Inputs: positive, negative, vae, latent, guide_data, motion_guide_data, model.
-
-    Returns (pos_out, neg_out, latent_out, model_out).
-    Falls back to a passthrough if the node is unavailable.
-    """
+def run_director_guide(pos_cond, neg_cond, video_vae, latent,
+                        guide_data, motion_guide_data, model,
+                        upscale_factor: float = 1.0, node_id: str = "pass") -> Tuple:
     from nodes import NODE_CLASS_MAPPINGS
     if "LTXDirectorGuide" not in NODE_CLASS_MAPPINGS:
-        print(f"  LTXDirectorGuide not found ({node_id}) -- passthrough.")
         return pos_cond, neg_cond, latent, model
-
-    # -- Skip the node entirely when there's no real guide/motion data --
-    # With no guide_data and no motion_guide_data (always true in t4_safe
-    # fallback mode, since LTXDirector itself was skipped), the WhatDreamsCost
-    # node has a known bug processing plain conditioning tensors:
-    #   'NestedTensor' object has no attribute 'clone'
-    # The node's own result in this state is a passthrough anyway, so skip the
-    # call outright instead of triggering + catching that internal exception.
     if guide_data is None and motion_guide_data is None:
-        print(f"  LTXDirectorGuide ({node_id}): no guide/motion data -- skipping call (passthrough).")
+        print(f"  LTXDirectorGuide ({node_id}): no guide data — passthrough.")
         return pos_cond, neg_cond, latent, model
 
-    guide_cls = NODE_CLASS_MAPPINGS["LTXDirectorGuide"]
+    guide_cls  = NODE_CLASS_MAPPINGS["LTXDirectorGuide"]
     guide_node = guide_cls()
-
-    # Introspect INPUT_TYPES to discover what the execute function actually accepts.
-    # This prevents passing unexpected kwargs (e.g. 'retake_image' which may not exist).
     try:
         input_types = guide_cls.INPUT_TYPES()
     except Exception:
         input_types = {"required": {}, "optional": {}}
-    required_params = set(input_types.get("required", {}).keys())
-    optional_params = set(input_types.get("optional", {}).keys())
-    all_accepted = required_params | optional_params
+    all_accepted = set(input_types.get("required", {}).keys()) | set(input_types.get("optional", {}).keys())
 
-    # Core linked inputs (always needed)
-    inputs = dict(
-        positive=pos_cond,
-        negative=neg_cond,
-        vae=video_vae,
-        latent=latent,
-        model=model,
-    )
-
-    # Widget values from workflow JSON (node 132/133)
-    # Order in widgets_values: [retake_image, upscale_factor_pass, upscale_factor,
-    #   interpolation, blend_radius, crop_method, use_tiling, tile_overlap,
-    #   tile_size, tile_stride, force_inpaint]
-    # BUT: the actual param names accepted by execute() may differ.
-    # Use introspection to only pass what the node declares.
+    inputs = dict(positive=pos_cond, negative=neg_cond, vae=video_vae, latent=latent, model=model)
     widget_candidates = {
-        "retake_image": "None",
-        "upscale_factor_pass": 1,
-        "upscale_factor": upscale_factor,
-        "interpolation": "bicubic",
-        "blend_radius": 1,
-        "crop_method": "center",
-        "use_tiling": True,
-        "tile_overlap": False,
-        "tile_size": 256,
-        "tile_stride": 64,
-        "force_inpaint": False,
+        "retake_image":"None","upscale_factor_pass":1,"upscale_factor":upscale_factor,
+        "interpolation":"bicubic","blend_radius":1,"crop_method":"center",
+        "use_tiling":True,"tile_overlap":False,"tile_size":256,
+        "tile_stride":64,"force_inpaint":False,
     }
-
     if all_accepted:
-        # Only pass widget params that the node actually declares
-        for param_name, val in widget_candidates.items():
-            if param_name in all_accepted:
-                inputs[param_name] = val
+        for k, v in widget_candidates.items():
+            if k in all_accepted:
+                inputs[k] = v
     else:
-        # No introspection available - pass all widget params EXCEPT retake_image
-        # (which is known to cause errors per runtime feedback)
-        for param_name, val in widget_candidates.items():
-            if param_name != "retake_image":
-                inputs[param_name] = val
-
-    # guide_data is a REQUIRED positional argument of LTXDirectorGuide.execute().
-    # It must always be passed (even as None) or the call raises:
-    #   "execute() missing 1 required positional argument: 'guide_data'"
-    # This happens on every call in t4_safe mode, since LTXDirector is skipped
-    # there and dir_guide_data is always None.
+        for k, v in widget_candidates.items():
+            if k != "retake_image":
+                inputs[k] = v
     if "guide_data" in all_accepted or not all_accepted:
         inputs["guide_data"] = guide_data
     if motion_guide_data is not None:
         inputs["motion_guide_data"] = motion_guide_data
 
     try:
-        # WhatDreamsCost custom nodes use the FUNCTION class attribute to define
-        # their execution method name (standard ComfyUI node pattern).
-        func_name = getattr(guide_cls, "FUNCTION", None)
-        if func_name:
-            func = getattr(guide_node, func_name)
-            out = func(**inputs)
-        else:
-            out = guide_node.EXECUTE_NORMALIZED(**inputs)
+        fn  = getattr(guide_cls, "FUNCTION", None)
+        out = getattr(guide_node, fn)(**inputs) if fn else guide_node.EXECUTE_NORMALIZED(**inputs)
     except (TypeError, AttributeError) as e:
-        print(f"  LTXDirectorGuide ({node_id}) failed: {e} -- passthrough.")
+        print(f"  LTXDirectorGuide ({node_id}) failed: {e} — passthrough.")
         return pos_cond, neg_cond, latent, model
 
-    pos_out   = get_value_at_index(out, 0)
-    neg_out   = get_value_at_index(out, 1)
-    lat_out   = get_value_at_index(out, 2)
-    model_out = get_value_at_index(out, 3) if len(out) > 3 else model
-    return pos_out, neg_out, lat_out, model_out
+    mem.stage_cleanup(f"director_guide_{node_id}")             # [MEM-5]
+    return (get_value_at_index(out, 0), get_value_at_index(out, 1),
+            get_value_at_index(out, 2),
+            get_value_at_index(out, 3) if len(out) > 3 else model)
 
-
-def run_director_crop_guides(pos_cond, neg_cond, latent, prefer_standard: bool = False) -> Tuple:
-    """
-    Run LTXDirectorCropGuides (workflow nodes 54 / 55), or the standard
-    LTXVCropGuides when there's no real Director data to work with.
-
-    Node 55: takes Guide133's pos/neg + pass1 separated video_latent -> feeds upsampler
-    Node 54: takes Guide132's pos/neg + pass2 separated video_latent -> feeds VAEDecode
-
-    Args:
-        prefer_standard: When True, skip LTXDirectorCropGuides entirely and use
-            the standard LTXVCropGuides node, even if LTXDirectorCropGuides is
-            installed. This matters because in fallback/t4_safe mode there is
-            no real guide_data for the Director's crop node to act on, and
-            calling it anyway has been observed to crash internally on plain
-            conditioning tensors (e.g. 'NestedTensor' object has no attribute
-            'clone'). A known-working simpler LTX pipeline sidesteps this
-            entirely by never calling the Director crop node at all -- only
-            the plain LTXVCropGuides -- so we do the same here when there's
-            nothing Director-specific to crop against.
-
-    Returns (pos_out, neg_out, lat_out).
-    """
+def run_director_crop_guides(pos_cond, neg_cond, latent,
+                              prefer_standard: bool = False) -> Tuple:
     from nodes import NODE_CLASS_MAPPINGS
-    use_director_crop = ("LTXDirectorCropGuides" in NODE_CLASS_MAPPINGS) and not prefer_standard
-    if not use_director_crop:
-        # Fallback to standard LTXVCropGuides (from LTXVideo)
+    use_director = ("LTXDirectorCropGuides" in NODE_CLASS_MAPPINGS) and not prefer_standard
+    if not use_director:
         if "LTXVCropGuides" in NODE_CLASS_MAPPINGS:
-            crop_node = NODE_CLASS_MAPPINGS["LTXVCropGuides"]()
-            out = crop_node.EXECUTE_NORMALIZED(
-                positive=pos_cond,
-                negative=neg_cond,
-                latent=latent,
-            )
+            out = NODE_CLASS_MAPPINGS["LTXVCropGuides"]().EXECUTE_NORMALIZED(
+                positive=pos_cond, negative=neg_cond, latent=latent)
         else:
-            print("  No crop guides node found -- passthrough.")
             return pos_cond, neg_cond, latent
     else:
-        crop_cls = NODE_CLASS_MAPPINGS["LTXDirectorCropGuides"]
+        crop_cls  = NODE_CLASS_MAPPINGS["LTXDirectorCropGuides"]
         crop_node = crop_cls()
-        crop_kwargs = dict(positive=pos_cond, negative=neg_cond, latent=latent)
         try:
-            # WhatDreamsCost custom nodes use the FUNCTION class attribute
-            func_name = getattr(crop_cls, "FUNCTION", None)
-            if func_name:
-                func = getattr(crop_node, func_name)
-                out = func(**crop_kwargs)
-            else:
-                out = crop_node.EXECUTE_NORMALIZED(**crop_kwargs)
+            fn  = getattr(crop_cls, "FUNCTION", None)
+            out = getattr(crop_node, fn)(positive=pos_cond, negative=neg_cond, latent=latent) \
+                  if fn else crop_node.EXECUTE_NORMALIZED(positive=pos_cond, negative=neg_cond, latent=latent)
         except (TypeError, AttributeError) as e:
-            print(f"  LTXDirectorCropGuides failed: {e} -- passthrough.")
+            print(f"  LTXDirectorCropGuides failed: {e} — passthrough.")
             return pos_cond, neg_cond, latent
 
-    pos_out = get_value_at_index(out, 0) if get_value_at_index(out, 0) is not None else pos_cond
-    neg_out = get_value_at_index(out, 1) if get_value_at_index(out, 1) is not None else neg_cond
-    lat_out = get_value_at_index(out, 2)
-    return pos_out, neg_out, lat_out
+    mem.stage_cleanup("crop_guides")                           # [MEM-5]
+    return (get_value_at_index(out, 0) or pos_cond,
+            get_value_at_index(out, 1) or neg_cond,
+            get_value_at_index(out, 2))
 
 
 # =============================================================================
 # SECTION 15 — TWO-PASS SAMPLING PIPELINE
 # =============================================================================
 
-def build_empty_latents(
-    num_frames: int,
-    latent_w: int,
-    latent_h: int,
-    fps: int,
-    image_preprocessed,
-    image_strength: float,
-    image_bypass: bool,
-    video_vae,
-    audio_vae,
-) -> Tuple:
-    """
-    Build the initial video + audio latents for one chunk.
-
-    Workflow mapping:
-        EmptyLTXVLatentVideo  (node implicit) → empty video latent
-        LTXVImgToVideoInplace (node 128 area) → condition on image
-        LTXVEmptyLatentAudio  (node 110)      → empty audio latent
-        LTXVConcatAVLatent    (node 29)        → fuse AV
-
-    Returns (av_latent_concat,).
-    """
-    # Empty video latent at half spatial resolution (LTX downsamples 2×)
+def build_empty_latents(num_frames, latent_w, latent_h, fps,
+                         image_preprocessed, image_strength, image_bypass,
+                         video_vae, audio_vae) -> Tuple:
     emptyltxvlatentvideo = get_node("EmptyLTXVLatentVideo")
     empty_video_lat = emptyltxvlatentvideo.EXECUTE_NORMALIZED(
-        width=latent_w,
-        height=latent_h,
-        length=num_frames,
-        batch_size=1,
-    )
+        width=latent_w, height=latent_h, length=num_frames, batch_size=1)
 
-    # Condition video latent on the input image
     ltxvimgtovideoinplace = get_node("LTXVImgToVideoInplace")
     img_conditioned_lat = ltxvimgtovideoinplace.EXECUTE_NORMALIZED(
-        strength=image_strength,
-        bypass=image_bypass,
-        vae=video_vae,
+        strength=image_strength, bypass=image_bypass, vae=video_vae,
         image=get_value_at_index(image_preprocessed, 0),
-        latent=get_value_at_index(empty_video_lat, 0),
-    )
+        latent=get_value_at_index(empty_video_lat, 0))
 
-    # Empty audio latent (model hallucinates audio from text)
     ltxvemptylatentaudio = get_node("LTXVEmptyLatentAudio")
     empty_audio_lat = ltxvemptylatentaudio.EXECUTE_NORMALIZED(
-        frames_number=num_frames,
-        frame_rate=fps,
-        batch_size=1,
-        audio_vae=audio_vae,
-    )
+        frames_number=num_frames, frame_rate=fps, batch_size=1, audio_vae=audio_vae)
 
-    # Fuse video + audio into joint AV latent (workflow node 29)
     ltxvconcatavlatent = get_node("LTXVConcatAVLatent")
-    if not image_bypass:
-        av_latent = ltxvconcatavlatent.EXECUTE_NORMALIZED(
-            video_latent=get_value_at_index(img_conditioned_lat, 0),
-            audio_latent=get_value_at_index(empty_audio_lat, 0),
-        )
-    else:
-        av_latent = ltxvconcatavlatent.EXECUTE_NORMALIZED(
-            video_latent=get_value_at_index(empty_video_lat, 0),
-            audio_latent=get_value_at_index(empty_audio_lat, 0),
-        )
+    video_src = get_value_at_index(img_conditioned_lat, 0) if not image_bypass \
+                else get_value_at_index(empty_video_lat, 0)
+    av_latent = ltxvconcatavlatent.EXECUTE_NORMALIZED(
+        video_latent=video_src,
+        audio_latent=get_value_at_index(empty_audio_lat, 0))
 
     del empty_video_lat, empty_audio_lat
-    mem.soft_cleanup()
+    mem.stage_cleanup("build_empty_latents")                   # [MEM-5]
     return av_latent, img_conditioned_lat
 
 
-def run_sampling_pass(
-    model,
-    pos_cond,
-    neg_cond,
-    latent,
-    noise_seed: int,
-    steps: int = WORKFLOW_STEPS,
-    cfg: float = WORKFLOW_CFG,
-    denoise: float = 1.0,
-    pass_name: str = "Pass1",
-) -> Any:
+def _get_sigmas_for_pass(model, steps: int, denoise: float, pass_label: str):
     """
-    Run one SamplerCustomAdvanced pass (workflow nodes 31 / 19).
-    Uses euler sampler + linear_quadratic BasicScheduler for both passes,
-    exactly matching the workflow JSON (nodes 32/33 and 20/BasicScheduler).
+    [MEM-4] Return sigma schedule via ManualSigmas (manual presets) or
+    BasicScheduler (scheduler mode), depending on SIGMA_PRESET_MODE.
+    ManualSigmas gives tighter VRAM usage because fewer intermediate latents
+    are created compared to full-step schedules.
+    """
+    mode = CONFIG.get("sigma_preset_mode", "scheduler")
+    if mode in SIGMA_PRESETS:
+        from nodes import NODE_CLASS_MAPPINGS
+        if "ManualSigmas" in NODE_CLASS_MAPPINGS:
+            preset = SIGMA_PRESETS[mode]
+            sigma_str = preset["pass1"] if "pass1" in pass_label.lower() else preset["pass2"]
+            msig = NODE_CLASS_MAPPINGS["ManualSigmas"]()
+            print(f"  Sigmas ({mode} {pass_label}): {sigma_str}")
+            return msig.EXECUTE_NORMALIZED(sigmas=sigma_str)
+        else:
+            print("  ManualSigmas node not found — falling back to BasicScheduler")
+    # Default: BasicScheduler
+    basicscheduler = get_node("BasicScheduler")
+    return basicscheduler.EXECUTE_NORMALIZED(
+        model=model, scheduler=WORKFLOW_SCHEDULER,
+        steps=steps, denoise=denoise)
 
-    CFG=1 is correct for distilled models (guidance is baked into weights).
-    Returns the raw output latent tuple.
-    """
+
+def run_sampling_pass(model, pos_cond, neg_cond, latent, noise_seed: int,
+                       steps: int = WORKFLOW_STEPS, cfg: float = WORKFLOW_CFG,
+                       denoise: float = 1.0, pass_name: str = "Pass1") -> Any:
     print(f"  Sampling {pass_name} ({steps} steps, denoise={denoise}, seed={noise_seed})...")
+    mem.pre_op_guard(f"sampling_{pass_name}", required_gb=1.0)  # [MEM-6]
+    print_vram_usage("  ")                                       # [MEM-6]
 
-    # Sampler — workflow nodes 20 / 32: both use "euler"
     ksamplerselect = get_node("KSamplerSelect")
     sampler = ksamplerselect.EXECUTE_NORMALIZED(sampler_name=WORKFLOW_SAMPLER_PASS1)
 
-    # Noise — workflow node 30
     randomnoise = get_node("RandomNoise")
     noise = randomnoise.EXECUTE_NORMALIZED(noise_seed=noise_seed)
 
-    # Sigma schedule — workflow nodes 33 (pass1: steps=8, denoise=1.0) / 21 (pass2: steps=4, denoise=0.42)
-    basicscheduler = get_node("BasicScheduler")
-    sigmas = basicscheduler.EXECUTE_NORMALIZED(
-        model=model,
-        scheduler=WORKFLOW_SCHEDULER,
-        steps=steps,
-        denoise=denoise,
-    )
+    sigmas = _get_sigmas_for_pass(model, steps, denoise, pass_name)  # [MEM-4]
 
-    # CFG guider (cfg=1 — distilled model)
     cfgguider = get_node("CFGGuider")
-    guider = cfgguider.EXECUTE_NORMALIZED(
-        cfg=cfg,
-        model=model,
-        positive=pos_cond,
-        negative=neg_cond,
-    )
+    guider = cfgguider.EXECUTE_NORMALIZED(cfg=cfg, model=model,
+                                           positive=pos_cond, negative=neg_cond)
 
-    # Run sampler (workflow nodes 19 / 31)
     samplercustomadvanced = get_node("SamplerCustomAdvanced")
     result = samplercustomadvanced.EXECUTE_NORMALIZED(
         noise=get_value_at_index(noise, 0),
@@ -2185,219 +1786,146 @@ def run_sampling_pass(
         sigmas=get_value_at_index(sigmas, 0),
         latent_image=latent,
     )
-
     del noise, sampler, sigmas, guider
-    mem.soft_cleanup()
+    mem.stage_cleanup(f"sampling_{pass_name}")                   # [MEM-5]
     return result
 
 
 def separate_av_latent(sampler_output, output_index: int = 0) -> Tuple:
-    """
-    Split joint AV latent back into video + audio (workflow nodes 22 / 34).
-    
-    For pass 1 (node 34): use output_index=0 (the output).
-    For pass 2 (node 22): use output_index=0 (the output).
-    
-    The workflow JSON wires SamplerCustomAdvanced slot 0 (output) to
-    LTXVSeparateAVLatent for both passes, matching this default.
-    
-    Returns (video_latent, audio_latent).
-    """
     ltxvseparateavlatent = get_node("LTXVSeparateAVLatent")
     separated = ltxvseparateavlatent.EXECUTE_NORMALIZED(
-        av_latent=get_value_at_index(sampler_output, output_index)
-    )
-    video_lat = get_value_at_index(separated, 0)
-    audio_lat = get_value_at_index(separated, 1)
-    return video_lat, audio_lat
+        av_latent=get_value_at_index(sampler_output, output_index))
+    mem.stage_cleanup("separate_av_latent")                      # [MEM-5]
+    return get_value_at_index(separated, 0), get_value_at_index(separated, 1)
 
 
 def upsample_video_latent(video_latent, upscaler_model, video_vae) -> Any:
-    """
-    2× spatial upscale in latent space (workflow node 14 — LTXVLatentUpsampler).
-    """
     print("  Upsampling latent (2×)...")
+    mem.pre_op_guard("LTXVLatentUpsampler", required_gb=0.5)    # [MEM-6]
     ltxvlatentupsampler = get_node("LTXVLatentUpsampler")
     result = ltxvlatentupsampler.upsample_latent(
-        samples=video_latent,
-        upscale_model=upscaler_model,
-        vae=video_vae,
-    )
+        samples=video_latent, upscale_model=upscaler_model, vae=video_vae)
+    mem.stage_cleanup("upsample_video_latent")                   # [MEM-5]
     return get_value_at_index(result, 0)
 
 
-def recondition_image_on_upscaled(
-    upscaled_latent,
-    image_preprocessed,
-    image_strength: float,
-    image_bypass: bool,
-    video_vae,
-    audio_lat_pass1,
-) -> Any:
-    """
-    Re-apply image conditioning onto the upscaled latent, then concat audio.
-    (Mirrors ltxvimgtovideoinplace_130 + ltxvconcatavlatent_129 in reference notebook.)
-    Returns the AV-concatenated latent for pass 2.
-    """
+def recondition_image_on_upscaled(upscaled_latent, image_preprocessed,
+                                    image_strength, image_bypass, video_vae,
+                                    audio_lat_pass1) -> Any:
     ltxvimgtovideoinplace = get_node("LTXVImgToVideoInplace")
     if not image_bypass:
         reconditioned = ltxvimgtovideoinplace.EXECUTE_NORMALIZED(
-            strength=image_strength,
-            bypass=image_bypass,
-            vae=video_vae,
-            image=get_value_at_index(image_preprocessed, 0),
-            latent=upscaled_latent,
-        )
-        video_lat_for_pass2 = get_value_at_index(reconditioned, 0)
+            strength=image_strength, bypass=image_bypass, vae=video_vae,
+            image=get_value_at_index(image_preprocessed, 0), latent=upscaled_latent)
+        video_lat_p2 = get_value_at_index(reconditioned, 0)
     else:
-        video_lat_for_pass2 = upscaled_latent
-
+        video_lat_p2 = upscaled_latent
     ltxvconcatavlatent = get_node("LTXVConcatAVLatent")
     av_latent_pass2 = ltxvconcatavlatent.EXECUTE_NORMALIZED(
-        video_latent=video_lat_for_pass2,
-        audio_latent=audio_lat_pass1,
-    )
+        video_latent=video_lat_p2, audio_latent=audio_lat_pass1)
+    mem.stage_cleanup("recondition_image_on_upscaled")           # [MEM-5]
     return av_latent_pass2
 
 
 # =============================================================================
-# SECTION 16 — VAE DECODING (chunked, never full-video at once)
+# SECTION 16 — VAE DECODING  [MEM-8] enhanced sub-batch decode
 # =============================================================================
 
 def decode_video_latent(video_latent, video_vae, max_batch_frames: int = 0) -> Any:
     """
-    Decode video latent to pixel frames using VAEDecode.
-    This is called per temporal chunk so the full 30-second video is
-    never decoded into GPU memory simultaneously.
+    [MEM-8] Chunked, VRAM-aware video VAE decode.
 
-    When system RAM is low, decodes in sub-batches of 8 latent temporal
-    frames to avoid a single massive CPU allocation.
-
-    Args:
-        video_latent: Latent tensor dict with key "samples" of shape (B, C, T, H, W).
-        video_vae: The loaded VAE model.
-        max_batch_frames: If >0, force sub-batch decoding with this many latent
-                          temporal frames per batch. If 0 (default), auto-detect
-                          based on available RAM.
-
-    Returns a frame tensor of shape (N, H, W, C) on CPU.
+    Improvements over original:
+      - Pre-op VRAM guard before decode begins
+      - non_blocking GPU→CPU transfer with explicit synchronize()
+      - Dynamic sub-batch size: scales down to 4 frames if RAM is critically low
+      - Per-sub-batch stage_cleanup() + VRAM bar print
+      - Immediate del of GPU tensors after each sub-batch
     """
     print("  VAE decoding video latent...")
+    mem.pre_op_guard("VAEDecode", required_gb=1.0)              # [MEM-6]
     vaedecode = get_node("VAEDecode")
 
-    # Determine if sub-batch decoding is needed
     latent_samples = video_latent["samples"] if isinstance(video_latent, dict) else video_latent
+
     if torch.is_tensor(latent_samples) and latent_samples.ndim == 5:
-        # latent shape: (B, C, T_latent, H_latent, W_latent)
-        # Pixel frames ~ T_latent * temporal_compression (typically 8 for LTX)
         t_latent = latent_samples.shape[2]
         h_latent = latent_samples.shape[3]
         w_latent = latent_samples.shape[4]
-        # Estimate pixel dimensions (8x spatial upscale from latent for LTX)
-        est_h = h_latent * 8
-        est_w = w_latent * 8
-        est_frames = t_latent * 8  # temporal compression factor
-        estimated_ram = mem.estimate_frame_ram_gb(est_frames, est_h, est_w)
-        available_ram = mem.cpu_available_gb()
+        est_h = h_latent * 8; est_w = w_latent * 8
+        est_frames  = t_latent * 8
+        est_ram_gb  = mem.estimate_frame_ram_gb(est_frames, est_h, est_w)
+        avail_ram   = mem.cpu_available_gb()
 
+        # [MEM-8] Dynamically pick sub-batch size
         use_subbatch = False
         if max_batch_frames > 0:
             use_subbatch = True
             batch_t = max_batch_frames
-        elif available_ram < estimated_ram + 2.0:
+        elif avail_ram < est_ram_gb + 3.0:
             use_subbatch = True
-            batch_t = 8  # 8 latent temporal frames per sub-batch
-            print(f"  [mem] Low RAM detected ({available_ram:.2f} GB available, "
-                  f"~{estimated_ram:.2f} GB needed). Using sub-batch decode "
-                  f"(batch_t={batch_t}).")
+            # Drop to 4-frame sub-batches when RAM is critically low
+            batch_t = 4 if avail_ram < est_ram_gb else 8
+            print(f"  [MEM-8] Sub-batch decode: avail={avail_ram:.2f} GB, "
+                  f"need≈{est_ram_gb:.2f} GB → batch_t={batch_t}")
 
         if use_subbatch and t_latent > batch_t:
-            # Sub-batch decode along temporal dimension
             all_frames = []
             for t_start in range(0, t_latent, batch_t):
                 t_end = min(t_start + batch_t, t_latent)
-                sub_latent_tensor = latent_samples[:, :, t_start:t_end, :, :]
-                sub_latent = {"samples": sub_latent_tensor}
-                decoded = vaedecode.decode(samples=sub_latent, vae=video_vae)
+                sub_lat = {"samples": latent_samples[:, :, t_start:t_end, :, :]}
+                decoded  = vaedecode.decode(samples=sub_lat, vae=video_vae)
                 frames_gpu = get_value_at_index(decoded, 0)
-                frames_batch_cpu = frames_gpu.detach().to("cpu", non_blocking=False)
+                # [MEM-8] non_blocking + explicit sync
+                frames_cpu_batch = frames_gpu.detach().to("cpu", non_blocking=True)
                 torch.cuda.synchronize()
-                all_frames.append(frames_batch_cpu)
-                del frames_gpu, decoded, sub_latent, sub_latent_tensor
-                mem.cleanup()
-
+                all_frames.append(frames_cpu_batch)
+                del frames_gpu, decoded, sub_lat
+                mem.stage_cleanup(f"sub-batch decode t={t_start}-{t_end}")  # [MEM-5]
+                if CONFIG["enable_memory_logging"]:
+                    print_vram_usage("    ")                    # [MEM-6] per sub-batch
             frames_cpu = torch.cat(all_frames, dim=0)
             del all_frames
             mem.soft_cleanup()
             return frames_cpu
 
-    # Standard full decode (original behavior)
-    decoded = vaedecode.decode(samples=video_latent, vae=video_vae)
+    # Standard full decode
+    decoded    = vaedecode.decode(samples=video_latent, vae=video_vae)
     frames_gpu = get_value_at_index(decoded, 0)
-
-    # Transfer to CPU immediately, non-blocking where safe
-    frames_cpu = frames_gpu.detach().to("cpu", non_blocking=False)
+    frames_cpu = frames_gpu.detach().to("cpu", non_blocking=True)
     torch.cuda.synchronize()
-
     del frames_gpu, decoded
-    mem.cleanup()
+    mem.stage_cleanup("decode_video_latent")                    # [MEM-5]
     return frames_cpu
 
 
 def decode_audio_latent(audio_latent, audio_vae) -> Any:
-    """
-    Decode audio latent to waveform (LTXVAudioVAEDecode).
-    Returns waveform data on CPU.
-    """
     print("  VAE decoding audio latent...")
     ltxvaudiovaedecode = get_node("LTXVAudioVAEDecode")
-    decoded = ltxvaudiovaedecode.EXECUTE_NORMALIZED(
-        samples=audio_latent,
-        audio_vae=audio_vae,
-    )
+    decoded  = ltxvaudiovaedecode.EXECUTE_NORMALIZED(samples=audio_latent, audio_vae=audio_vae)
     audio_out = get_value_at_index(decoded, 0)
-    # Move waveform to CPU
     if torch.is_tensor(audio_out):
         audio_out = audio_out.detach().cpu()
-    elif isinstance(audio_out, dict):
-        if "waveform" in audio_out and torch.is_tensor(audio_out["waveform"]):
+    elif isinstance(audio_out, dict) and "waveform" in audio_out:
+        if torch.is_tensor(audio_out["waveform"]):
             audio_out = {**audio_out, "waveform": audio_out["waveform"].detach().cpu()}
     del decoded
-    mem.cleanup()
+    mem.stage_cleanup("decode_audio_latent")                    # [MEM-5]
     return audio_out
 
 
 # =============================================================================
-# SECTION 17 — CHUNK SAVING (frames → MP4 via ffmpeg)
+# SECTION 17 — CHUNK SAVING
 # =============================================================================
 
-def save_chunk_to_disk(
-    frames_cpu: Any,
-    audio_cpu: Any,
-    chunk_index: int,
-    fps: int,
-    width: int,
-    height: int,
-) -> str:
-    """
-    Write decoded frames + audio to a chunk MP4 file.
-
-    Uses the ComfyUI CreateVideo node where possible; falls back to
-    direct ffmpeg frame-pipe writing so the full frame array is never
-    duplicated in RAM.
-
-    Returns the output chunk path.
-    """
+def save_chunk_to_disk(frames_cpu, audio_cpu, chunk_index, fps, width, height) -> str:
     chunks_dir = os.path.join(CONFIG["workspace_dir"], "chunks")
     Path(chunks_dir).mkdir(parents=True, exist_ok=True)
     chunk_path = os.path.join(chunks_dir, f"chunk_{chunk_index:04d}.mp4")
 
-    # ── Try ComfyUI CreateVideo node ─────────────────────────────────────────
-    # Skip CreateVideo when RAM is low to avoid buffering all frames in memory
     ram_too_low = not mem.is_ram_safe(required_gb=4.0)
     if ram_too_low:
-        print(f"  [mem] RAM too low ({mem.cpu_available_gb():.2f} GB available < 4.0 GB). "
-              f"Skipping CreateVideo, using streaming ffmpeg.")
+        print(f"  [mem] RAM low ({mem.cpu_available_gb():.2f} GB) — using streaming ffmpeg.")
 
     if not ram_too_low:
         try:
@@ -2405,89 +1933,50 @@ def save_chunk_to_disk(
             if "CreateVideo" in NODE_CLASS_MAPPINGS:
                 createvideo = NODE_CLASS_MAPPINGS["CreateVideo"]()
                 video_obj = createvideo.EXECUTE_NORMALIZED(
-                    fps=fps,
-                    images=frames_cpu,
-                    audio=audio_cpu,
-                )
+                    fps=fps, images=frames_cpu, audio=audio_cpu)
                 video = get_value_at_index(video_obj, 0)
-                # Save using ComfyUI API
                 import folder_paths
                 from comfy_api.latest import Types
                 w = frames_cpu.shape[2] if frames_cpu.ndim == 4 else width
                 h = frames_cpu.shape[1] if frames_cpu.ndim == 4 else height
                 full_folder, fname, counter, _, _ = folder_paths.get_save_image_path(
-                    f"chunk_{chunk_index:04d}",
-                    folder_paths.get_output_directory(),
-                    w, h,
-                )
+                    f"chunk_{chunk_index:04d}", folder_paths.get_output_directory(), w, h)
                 ext = Types.VideoContainer.get_extension("auto")
                 tmp_path = os.path.join(full_folder, f"{fname}_{counter:05d}_.{ext}")
-                video.save_to(
-                    tmp_path,
-                    format=Types.VideoContainer("auto"),
-                    codec="auto",
-                    metadata=None,
-                )
-                # Move to our chunks directory
+                video.save_to(tmp_path, format=Types.VideoContainer("auto"),
+                              codec="auto", metadata=None)
                 shutil.move(tmp_path, chunk_path)
                 del video_obj, video
-                mem.soft_cleanup()
-                print(f"  \u2713 Chunk {chunk_index:04d} saved (CreateVideo): {chunk_path}")
+                mem.stage_cleanup("save_chunk CreateVideo")    # [MEM-5]
+                print(f"  ✓ Chunk {chunk_index:04d} saved (CreateVideo): {chunk_path}")
                 return chunk_path
         except Exception as e:
-            print(f"  CreateVideo path failed ({e}), falling back to ffmpeg pipe...")
+            print(f"  CreateVideo failed ({e}), falling back to ffmpeg pipe...")
 
-    # ── Fallback: write frames via ffmpeg stdin pipe ──────────────────────────
     _write_chunk_via_ffmpeg(frames_cpu, audio_cpu, chunk_path, fps, width, height)
     return chunk_path
 
 
-def _write_chunk_via_ffmpeg(frames_cpu, audio_cpu, out_path: str, fps: int, w: int, h: int):
-    """
-    Pipe raw RGB frames directly into ffmpeg. Streams one frame at a time
-    to avoid doubling RAM with a full numpy copy of the frame tensor.
-    """
-    if torch.is_tensor(frames_cpu):
-        n_frames = frames_cpu.shape[0]
-        fh, fw = frames_cpu.shape[1], frames_cpu.shape[2]
-    else:
-        # Already numpy
-        n_frames, fh, fw = frames_cpu.shape[0], frames_cpu.shape[1], frames_cpu.shape[2]
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo",
-        "-vcodec", "rawvideo",
-        "-s", f"{fw}x{fh}",
-        "-pix_fmt", "rgb24",
-        "-r", str(fps),
-        "-i", "pipe:0",
-        "-vcodec", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-crf", "18",
-        "-preset", "fast",
-        out_path,
-    ]
+def _write_chunk_via_ffmpeg(frames_cpu, audio_cpu, out_path, fps, w, h):
+    n_frames = frames_cpu.shape[0] if torch.is_tensor(frames_cpu) else frames_cpu.shape[0]
+    fh = frames_cpu.shape[1]; fw = frames_cpu.shape[2]
+    cmd = ["ffmpeg","-y","-f","rawvideo","-vcodec","rawvideo",
+           "-s",f"{fw}x{fh}","-pix_fmt","rgb24","-r",str(fps),"-i","pipe:0",
+           "-vcodec","libx264","-pix_fmt","yuv420p","-crf","18","-preset","fast",
+           out_path]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-
-    # Stream frame-by-frame to keep RAM usage constant
     for i in range(n_frames):
-        if torch.is_tensor(frames_cpu):
-            frame = (frames_cpu[i].clamp(0, 1) * 255).byte().numpy()
-        else:
-            frame = frames_cpu[i]
+        frame = (frames_cpu[i].clamp(0,1)*255).byte().numpy() \
+                if torch.is_tensor(frames_cpu) else frames_cpu[i]
         proc.stdin.write(frame.tobytes())
         del frame
         if i % 16 == 0:
-            gc.collect()
-
-    proc.stdin.close()
-    proc.wait()
-    print(f"  \u2713 Chunk saved (ffmpeg pipe, streaming): {out_path}")
+            gc.collect()                                       # [MEM-5] periodic GC during write
+    proc.stdin.close(); proc.wait()
+    print(f"  ✓ Chunk {os.path.basename(out_path)} saved (ffmpeg stream).")
 
 
 def compute_file_checksum(path: str) -> str:
-    """MD5 checksum of a file for resume validation."""
     h = hashlib.md5()
     with open(path, "rb") as f:
         for block in iter(lambda: f.read(65536), b""):
@@ -2496,7 +1985,7 @@ def compute_file_checksum(path: str) -> str:
 
 
 # =============================================================================
-# SECTION 18 — SINGLE CHUNK GENERATION  (generate_chunk)
+# SECTION 18 — SINGLE CHUNK GENERATION   [MEM-5] [MEM-6] dense application
 # =============================================================================
 
 def generate_chunk(
@@ -2513,371 +2002,314 @@ def generate_chunk(
     global_seed: int,
 ) -> Dict:
     """
-    Generate one temporal chunk using the full LTX-2.3 Director 2.0 pipeline.
+    Full LTX-2.3 Director 2.0 two-pass pipeline for one temporal chunk.
 
-    Correct pipeline execution order (matching workflow JSON):
-        1.  Load VAEs, DiT model, upscaler
-        2.  Build LTXDirector conditioning (provides model, positive, video_latent,
-            audio_latent, guide_data, motion_guide_data, frame_rate)
-        3.  Build text conditioning (ConditioningZeroOut + LTXVConditioning)
-        4.  LTXDirectorGuide pass 1 (node 133, upscale_factor=0.5)
-            - Takes: conditioning pos/neg, VAE, LTXDirector video_latent,
-              guide_data, motion_guide_data, LTXDirector model
-            - Outputs: pos, neg, latent, model
-        5.  LTXVConcatAVLatent (node 29): Guide133 latent + LTXDirector audio_latent
-        6.  CFGGuider (node 28): uses Guide133 model/pos/neg
-        7.  SamplerCustomAdvanced (node 31): Pass 1 (8 steps, denoise=1.0)
-        8.  LTXVSeparateAVLatent (node 34): splits pass1 output[0]
-        9.  LTXDirectorCropGuides (node 55): Guide133 pos/neg + separated video
-        10. LTXVLatentUpsampler (node 14): CropGuides55 latent output
-        11. LTXDirectorGuide pass 2 (node 132, upscale_factor=1.0)
-            - Takes: CropGuides55 pos/neg, VAE, upsampled latent,
-              guide_data, motion_guide_data, LTXDirector model
-            - Outputs: pos, neg, latent, model
-        12. LTXVConcatAVLatent (node 18): Guide132 latent + pass1 separated audio
-        13. CFGGuider (node 17): uses Guide132 model/pos/neg
-        14. SamplerCustomAdvanced (node 19): Pass 2 (4 steps, denoise=0.42)
-        15. LTXVSeparateAVLatent (node 22): pass2 output[0] (the output)
-        16. LTXDirectorCropGuides (node 54): Guide132 pos/neg + separated video
-        17. VAEDecode: CropGuides54 latent
-        18. LTXVAudioVAEDecode: separated audio from pass2
-        19. Save chunk to disk, release GPU tensors
-
-    Returns dict with keys: chunk_index, start_frame, num_frames, fps, path.
-    Never returns GPU tensors.
+    [MEM-5] mem.stage_cleanup()   called after EVERY pipeline stage.
+    [MEM-6] mem.pre_op_guard()    called before every heavy allocation.
+    [MEM-6] print_vram_usage()    printed at chunk start, after DiT load,
+                                   before/after each sampling pass, and before decode.
+    [MEM-2] ModelCache            keeps DiT+VAEs alive between chunks.
+    [MEM-4] _get_sigmas_for_pass  uses ManualSigmas when sigma_preset_mode != 'scheduler'.
     """
-    idx          = chunk_desc["chunk_index"]
-    start_frame  = chunk_desc["start_frame"]
-    num_frames   = chunk_desc["num_frames"]
-    chunk_seed   = get_chunk_seed(global_seed, idx)
+    idx         = chunk_desc["chunk_index"]
+    start_frame = chunk_desc["start_frame"]
+    num_frames  = chunk_desc["num_frames"]
+    chunk_seed  = get_chunk_seed(global_seed, idx)
     img_compress = profile.get("img_compression", WORKFLOW_IMG_COMPRESSION)
     longer_edge  = profile.get("longer_edge", 1312)
+    no_director_data = False   # updated after build_director_conditioning
 
     mem.set_chunk_info(idx, num_frames, width, height)
-    if CONFIG["enable_memory_logging"]:
-        print(f"\n  GPU before chunk {idx}: {mem.gpu_free_gb():.2f} GB free")
+
+    # ── [MEM-6] Per-chunk banner + VRAM bar ───────────────────────────────────
+    print(f"\n{'='*62}")
+    print(f"  CHUNK {idx+1:03d}  frames {start_frame}–{start_frame+num_frames-1}"
+          f"  ({num_frames} frames)  seed={chunk_seed}")
+    print(f"{'='*62}")
+    print_vram_usage("  ")
+    print(f"  {mem.ram_status()}")
+
+    # [MEM-6] Hard pre-chunk VRAM guard — aggressive cleanup before anything loads
+    mem.pre_op_guard(f"chunk_{idx}_start", required_gb=2.0)
 
     with torch.inference_mode():
-        # -- 1. Image preprocessing --
-        preprocessed, latent_w, latent_h = prepare_image_for_chunk(
-            loaded_image_tuple, width, height, img_compress, longer_edge
-        )
 
-        # -- 2. Load VAEs (deferred for t4_safe to reduce peak memory) --
-        # In t4_safe mode, we defer video_vae loading until step 7 (Director Guide)
-        # since it is not needed earlier. audio_vae is still needed for the fallback
-        # path in build_director_conditioning (step 4: LTXVEmptyLatentAudio).
-        # In non-t4_safe modes, load both upfront for the Director path that may
-        # need them earlier.
-        active_profile = T4_PROFILES.get(QUALITY_MODE, {})
+        # ── Stage 1: Image preprocessing ──────────────────────────────────────
+        preprocessed, latent_w, latent_h = prepare_image_for_chunk(
+            loaded_image_tuple, width, height, img_compress, longer_edge)
+        # stage_cleanup already called inside prepare_image_for_chunk
+
+        # ── Stage 2: Load VAEs ────────────────────────────────────────────────
+        # [MEM-6] Defer video_vae in t4_safe to reduce peak VRAM during DiT load
+        active_profile = T4_PROFILES.get(CONFIG["quality_mode"], {})
         if active_profile.get("skip_director", False):
-            # T4-safe: load only audio_vae now, defer video_vae
-            print("  [t4_safe] Deferring video VAE load (saving ~1GB during DiT load)")
-            video_vae = None  # Will be loaded before Director Guide (step 7)
+            print("  [t4_safe] Deferring video VAE — loading audio VAE only now.")
+            video_vae = None
             audio_vae = load_audio_vae()
         else:
-            # Non-t4-safe: load both for LTXDirector path
             video_vae = load_video_vae()
             audio_vae = load_audio_vae()
+        mem.stage_cleanup("vae_load")                          # [MEM-5]
+        print_vram_usage("  ")                                 # [MEM-6]
 
-        # -- 3. Load upscaler (DEFERRED until after pass 1 to reduce VRAM pressure) --
-        # The upscaler is only needed for step 12 (between pass 1 and pass 2).
-        # Loading it here would consume VRAM during pass 1 sampling, causing OOM
-        # on T4 GPUs where DiT + LoRAs already use most of the 15 GB.
-        upscaler = None  # Will be loaded after pass 1 completes
+        # ── Stage 3: Upscaler deferred ────────────────────────────────────────
+        # Do NOT load upscaler here — it would consume VRAM during pass-1 sampling.
+        # Loaded at Stage 12 (between pass 1 and pass 2).
+        upscaler = None
 
-        # -- 4. Build LTXDirector conditioning or fallback --
-        # DiT model is loaded inside build_director_conditioning (or its fallback)
-        # via load_dit_model() which uses a cache. We do NOT load it here separately
-        # to avoid having two copies in VRAM simultaneously (OOM on T4).
-        # LTXDirector returns: (model, positive, video_latent, audio_latent,
-        #                        guide_data, motion_guide_data, frame_rate)
+        # ── Stage 4: LTXDirector / fallback conditioning ──────────────────────
+        mem.pre_op_guard("build_director_conditioning", required_gb=1.0)  # [MEM-6]
         director_result = build_director_conditioning(
-            pos_cond=pos_cond,
-            neg_cond=neg_cond,
-            image_path=None,
-            audio_path=None,
-            num_frames=num_frames,
-            fps=fps,
-            width=width,
-            height=height,
+            pos_cond=pos_cond, neg_cond=neg_cond,
+            image_path=None, audio_path=None,
+            num_frames=num_frames, fps=fps,
+            width=width, height=height,
             audio_vae=audio_vae,
         )
         (dir_model, dir_positive, dir_video_latent, dir_audio_latent,
          dir_guide_data, dir_motion_guide_data, dir_frame_rate) = director_result
 
-        # True when there's no real Director guide/motion data to act on
-        # (always the case in t4_safe fallback mode, since LTXDirector itself
-        # is skipped there). Used to force the standard LTXVCropGuides node
-        # instead of LTXDirectorCropGuides, which has been observed to crash
-        # ('NestedTensor' object has no attribute 'clone') when there's
-        # nothing Director-specific for it to crop against.
         no_director_data = (dir_guide_data is None and dir_motion_guide_data is None)
-
-        # Use director model as the base model for both sampling passes.
-        # This is the ONLY copy of the DiT in memory.
         base_model = dir_model
+        mem.stage_cleanup("build_director_conditioning")       # [MEM-5]
+        print_vram_usage("  ")                                 # [MEM-6] after DiT in memory
 
-        # -- 6. Determine video latent for pass 1 --
-        # When LTXDirector provides video_latent, use it directly (no empty latents needed).
-        # Otherwise fall back to building empty latents.
+        # ── Stage 5: Determine video latent + audio for pass 1 ───────────────
         if dir_video_latent is not None:
-            # LTXDirector provides video_latent directly (replaces EmptyLTXVLatentVideo)
-            video_latent_pass1 = dir_video_latent
+            video_latent_pass1     = dir_video_latent
             audio_latent_for_concat = dir_audio_latent
         else:
-            # Fallback: build empty latents the old way.
-            # NOTE: build_empty_latents already fuses video+audio via LTXVConcatAVLatent
-            # internally, so the returned av_latent is already an AV-fused latent.
-            # We must NOT concat additional audio at step 8 (that would double-concat).
-            # Ensure video_vae is loaded (may have been deferred in t4_safe mode)
             if video_vae is None:
                 video_vae = load_video_vae()
-            av_latent_pass1, img_conditioned_lat = build_empty_latents(
+            av_latent_p1, img_conditioned_lat = build_empty_latents(
                 num_frames, latent_w, latent_h, fps,
                 preprocessed, image_strength, image_bypass,
-                video_vae, audio_vae,
-            )
-            # IMPORTANT: LTXDirectorGuide (workflow node 133) expects a PURE
-            # video latent as its "latent" input (per workflow JSON, node 131
-            # slot 2 -> node 133 input 3). Audio is only concatenated in
-            # AFTERWARD at step 8 (LTXVConcatAVLatent, node 29). Feeding it the
-            # already AV-fused latent instead causes an internal crash in the
-            # WhatDreamsCost node ('NestedTensor' object has no attribute
-            # 'clone'), because it isn't built to accept a fused AV structure.
+                video_vae, audio_vae)
             video_latent_pass1 = get_value_at_index(img_conditioned_lat, 0)
-            ltxvemptylatentaudio_fb = get_node("LTXVEmptyLatentAudio")
-            fresh_audio_lat = ltxvemptylatentaudio_fb.EXECUTE_NORMALIZED(
-                frames_number=num_frames, frame_rate=fps, batch_size=1, audio_vae=audio_vae,
-            )
+            fresh_audio = get_node("LTXVEmptyLatentAudio")
+            fresh_audio_lat = fresh_audio.EXECUTE_NORMALIZED(
+                frames_number=num_frames, frame_rate=fps, batch_size=1, audio_vae=audio_vae)
             audio_latent_for_concat = get_value_at_index(fresh_audio_lat, 0)
-            del av_latent_pass1, img_conditioned_lat, fresh_audio_lat
-            mem.soft_cleanup()
+            del av_latent_p1, img_conditioned_lat, fresh_audio_lat
+            mem.stage_cleanup("build_empty_latents_fallback")  # [MEM-5]
 
-        # -- 6b. Build Director-aware conditioning (workflow nodes 128 + 27) --
-        # When LTXDirector provides dir_positive (timeline-segmented conditioning),
-        # we must route it through ConditioningZeroOut -> LTXVConditioning to produce
-        # the pos/neg that Guide pass 1 receives. This is the Director's core value:
-        # multi-segment timeline data (image refs, audio markers, per-segment prompts).
+        # ── Stage 6b: Director-aware conditioning wrap ────────────────────────
         if dir_positive is not None:
             conditioningzeroout = get_node("ConditioningZeroOut")
-            neg_from_director = conditioningzeroout.zero_out(conditioning=dir_positive)
+            neg_from_dir = conditioningzeroout.zero_out(conditioning=dir_positive)
             ltxvconditioning = get_node("LTXVConditioning")
-            director_cond = ltxvconditioning.EXECUTE_NORMALIZED(
+            dir_cond = ltxvconditioning.EXECUTE_NORMALIZED(
                 frame_rate=dir_frame_rate,
                 positive=dir_positive,
-                negative=get_value_at_index(neg_from_director, 0),
-            )
-            cond_pos_for_guide = get_value_at_index(director_cond, 0)
-            cond_neg_for_guide = get_value_at_index(director_cond, 1)
+                negative=get_value_at_index(neg_from_dir, 0))
+            cond_pos_g = get_value_at_index(dir_cond, 0)
+            cond_neg_g = get_value_at_index(dir_cond, 1)
+            del neg_from_dir, dir_cond
+            mem.stage_cleanup("director_cond_wrap")            # [MEM-5]
         else:
-            # Fallback: use plain text conditioning from build_text_conditioning
-            cond_pos_for_guide = pos_cond
-            cond_neg_for_guide = neg_cond
+            cond_pos_g = pos_cond
+            cond_neg_g = neg_cond
 
-        # -- 7. LTXDirectorGuide pass 1 (workflow node 133: upscale_factor=0.5) --
-        # Takes: pos/neg conditioning, VAE, video_latent from LTXDirector,
-        #        guide_data, motion_guide_data, base model
-        # Load video_vae now if deferred (t4_safe mode defers to reduce peak memory)
+        # ── Stage 7: Ensure video_vae loaded, then Director Guide pass 1 ─────
         if video_vae is None:
             video_vae = load_video_vae()
-        pos_g1, neg_g1, lat_g1, model_g1 = run_director_guide(
-            pos_cond=cond_pos_for_guide,
-            neg_cond=cond_neg_for_guide,
-            video_vae=video_vae,
-            latent=video_latent_pass1,
-            guide_data=dir_guide_data,
-            motion_guide_data=dir_motion_guide_data,
-            model=base_model,
-            upscale_factor=0.5,
-            node_id="pass1 (node 133)",
-        )
+        mem.stage_cleanup("video_vae_deferred_load")           # [MEM-5]
 
-        # -- 8. LTXVConcatAVLatent (workflow node 29) --
-        # Concatenates Guide133's latent output + LTXDirector's audio_latent
+        mem.pre_op_guard("director_guide_pass1", required_gb=0.5)  # [MEM-6]
+        pos_g1, neg_g1, lat_g1, model_g1 = run_director_guide(
+            pos_cond=cond_pos_g, neg_cond=cond_neg_g,
+            video_vae=video_vae, latent=video_latent_pass1,
+            guide_data=dir_guide_data, motion_guide_data=dir_motion_guide_data,
+            model=base_model, upscale_factor=0.5, node_id="pass1 (node 133)")
+        del video_latent_pass1
+        mem.stage_cleanup("director_guide_pass1")              # [MEM-5]
+
+        # ── Stage 8: LTXVConcatAVLatent — Guide133 latent + audio ─────────────
         if audio_latent_for_concat is not None:
             ltxvconcatavlatent = get_node("LTXVConcatAVLatent")
-            av_concat_pass1 = ltxvconcatavlatent.EXECUTE_NORMALIZED(
-                video_latent=lat_g1,
-                audio_latent=audio_latent_for_concat,
-            )
-            latent_for_sampler1 = get_value_at_index(av_concat_pass1, 0)
-            del av_concat_pass1
+            av_concat_p1 = ltxvconcatavlatent.EXECUTE_NORMALIZED(
+                video_latent=lat_g1, audio_latent=audio_latent_for_concat)
+            latent_for_s1 = get_value_at_index(av_concat_p1, 0)
+            del av_concat_p1
+            mem.stage_cleanup("concat_av_pass1")               # [MEM-5]
         else:
-            # Fallback path: latent already contains AV data
-            latent_for_sampler1 = lat_g1
+            latent_for_s1 = lat_g1
 
-        # -- 9. Sampling pass 1 (workflow node 31: 8 steps, denoise=1.0) --
-        # CFGGuider (node 28) uses Guide133's model/pos/neg outputs
-        sample_out_1 = run_sampling_pass(
-            model=model_g1,
-            pos_cond=pos_g1,
-            neg_cond=neg_g1,
-            latent=latent_for_sampler1,
-            noise_seed=chunk_seed,
-            steps=WORKFLOW_STEPS,
-            cfg=WORKFLOW_CFG,
-            denoise=1.0,
-            pass_name=f"Pass1 (chunk {idx})",
-        )
-
-        del latent_for_sampler1
-        mem.cleanup()
+        # ── Stage 9: Sampling pass 1 (8 steps, denoise=1.0) ──────────────────
         mem.warn_if_low()
+        print_vram_usage("  ")                                 # [MEM-6] before pass 1
+        sample_out_1 = run_sampling_pass(
+            model=model_g1, pos_cond=pos_g1, neg_cond=neg_g1,
+            latent=latent_for_s1, noise_seed=chunk_seed,
+            steps=WORKFLOW_STEPS, cfg=WORKFLOW_CFG, denoise=1.0,
+            pass_name=f"Pass1 (chunk {idx})")
+        del latent_for_s1
+        mem.aggressive_cleanup()                               # [MEM-5] full sweep after pass 1
+        print_vram_usage("  ")                                 # [MEM-6] after pass 1
 
-        # -- 10. Separate AV latent (workflow node 34) --
-        # Pass 1 uses output index 0 (raw output)
+        # ── Stage 10: Separate AV latent (node 34) ───────────────────────────
         video_lat_p1, audio_lat_p1 = separate_av_latent(sample_out_1, output_index=0)
         del sample_out_1
-        mem.soft_cleanup()
+        mem.stage_cleanup("separate_av_pass1")                 # [MEM-5]
 
-        # -- 11. LTXDirectorCropGuides (workflow node 55) --
-        # Takes Guide133's pos/neg outputs + separated video from pass1
+        # ── Stage 11: Director Crop Guides (node 55) ─────────────────────────
         pos_crop55, neg_crop55, lat_crop55 = run_director_crop_guides(
-            pos_cond=pos_g1,
-            neg_cond=neg_g1,
-            latent=video_lat_p1,
-            prefer_standard=no_director_data,
-        )
+            pos_cond=pos_g1, neg_cond=neg_g1,
+            latent=video_lat_p1, prefer_standard=no_director_data)
         del video_lat_p1, pos_g1, neg_g1, model_g1
-        mem.soft_cleanup()
+        mem.stage_cleanup("crop_guides_55")                    # [MEM-5]
 
-        # -- 12. 2x latent spatial upscale (workflow node 14) --
-        # Takes CropGuides55's latent output (slot 2)
-        # Load upscaler NOW (deferred from step 3 to avoid VRAM pressure during pass 1)
+        # ── Stage 12: Load upscaler (deferred), upsample 2× ─────────────────
+        mem.pre_op_guard("upscaler_load", required_gb=0.5)     # [MEM-6]
         upscaler = load_upscaler_model()
         upscaled_lat = upsample_video_latent(lat_crop55, upscaler, video_vae)
         del lat_crop55, upscaler
-        mem.cleanup()
+        mem.aggressive_cleanup()                               # [MEM-5] free upscaler ASAP
+        print_vram_usage("  ")                                 # [MEM-6] after upscale
 
-        # -- 13. LTXDirectorGuide pass 2 (workflow node 132: upscale_factor=1.0) --
-        # Takes: CropGuides55's pos/neg, VAE, upsampled latent,
-        #        LTXDirector's guide_data, motion_guide_data, base model
+        # ── Stage 13: Director Guide pass 2 (node 132, upscale_factor=1.0) ───
+        mem.pre_op_guard("director_guide_pass2", required_gb=0.5)  # [MEM-6]
         pos_g2, neg_g2, lat_g2, model_g2 = run_director_guide(
-            pos_cond=pos_crop55,
-            neg_cond=neg_crop55,
-            video_vae=video_vae,
-            latent=upscaled_lat,
-            guide_data=dir_guide_data,
-            motion_guide_data=dir_motion_guide_data,
-            model=base_model,
-            upscale_factor=1.0,
-            node_id="pass2 (node 132)",
-        )
+            pos_cond=pos_crop55, neg_cond=neg_crop55,
+            video_vae=video_vae, latent=upscaled_lat,
+            guide_data=dir_guide_data, motion_guide_data=dir_motion_guide_data,
+            model=base_model, upscale_factor=1.0, node_id="pass2 (node 132)")
         del pos_crop55, neg_crop55, upscaled_lat
-        mem.cleanup()
-        mem.warn_if_low()
+        mem.stage_cleanup("director_guide_pass2")              # [MEM-5]
 
-        # ── Free director tensors no longer needed after Guide pass 2 ────────
-        del dir_model, dir_guide_data, dir_motion_guide_data, dir_frame_rate
-        # dir_positive, dir_video_latent, dir_audio_latent may still be referenced
-        # via other names but ensure no stale references linger
-        try:
-            del dir_positive
-        except NameError:
-            pass
-        try:
-            del dir_video_latent
-        except NameError:
-            pass
-        try:
-            del dir_audio_latent
-        except NameError:
-            pass
-        mem.soft_cleanup()
+        # Free director tensors — no longer needed after Guide pass 2
+        for _name in ("dir_model","dir_guide_data","dir_motion_guide_data",
+                       "dir_frame_rate","dir_positive","dir_video_latent","dir_audio_latent"):
+            try:
+                del locals()[_name]
+            except KeyError:
+                pass
+        # Force-delete via explicit assignments
+        dir_guide_data = None; dir_motion_guide_data = None
+        mem.stage_cleanup("free_director_tensors")             # [MEM-5]
 
-        # -- 14. LTXVConcatAVLatent (workflow node 18) --
-        # Concatenates Guide132's latent(2) + pass1 separated audio_latent(1)
+        # ── Stage 14: LTXVConcatAVLatent — Guide132 latent + pass1 audio ─────
         ltxvconcatavlatent2 = get_node("LTXVConcatAVLatent")
-        av_concat_pass2 = ltxvconcatavlatent2.EXECUTE_NORMALIZED(
-            video_latent=lat_g2,
-            audio_latent=audio_lat_p1,
-        )
-        latent_for_sampler2 = get_value_at_index(av_concat_pass2, 0)
-        del av_concat_pass2, audio_lat_p1, lat_g2
-        mem.soft_cleanup()
+        av_concat_p2 = ltxvconcatavlatent2.EXECUTE_NORMALIZED(
+            video_latent=lat_g2, audio_latent=audio_lat_p1)
+        latent_for_s2 = get_value_at_index(av_concat_p2, 0)
+        del av_concat_p2, audio_lat_p1, lat_g2
+        mem.stage_cleanup("concat_av_pass2")                   # [MEM-5]
 
-        # -- 15. Sampling pass 2 (workflow node 19: 4 steps, denoise=0.42) --
-        # CFGGuider (node 17) uses Guide132's model/pos/neg outputs
+        # ── Stage 15: Sampling pass 2 (4 steps, denoise=0.42) ────────────────
+        mem.warn_if_low()
+        print_vram_usage("  ")                                 # [MEM-6] before pass 2
         sample_out_2 = run_sampling_pass(
-            model=model_g2,
-            pos_cond=pos_g2,
-            neg_cond=neg_g2,
-            latent=latent_for_sampler2,
-            noise_seed=0,          # workflow node 30: seed=0 for refinement pass
-            steps=WORKFLOW_STEPS_PASS2,
-            cfg=WORKFLOW_CFG,
+            model=model_g2, pos_cond=pos_g2, neg_cond=neg_g2,
+            latent=latent_for_s2, noise_seed=0,
+            steps=WORKFLOW_STEPS_PASS2, cfg=WORKFLOW_CFG,
             denoise=WORKFLOW_DENOISE_PASS2,
-            pass_name=f"Pass2 (chunk {idx})",
-        )
+            pass_name=f"Pass2 (chunk {idx})")
+        del latent_for_s2, model_g2
 
-        del latent_for_sampler2, model_g2
-        # Release the DiT model cache and base_model reference to free VRAM
-        # before decode (which needs the memory for frame tensors).
+        # [MEM-5][MEM-6] Release DiT BEFORE decode to free ~12 GB VRAM
         try:
             del base_model
         except NameError:
             pass
         release_dit_model()
-        mem.cleanup()
+        mem.aggressive_cleanup()                               # [MEM-5] biggest sweep of chunk
+        print_vram_usage("  ")                                 # [MEM-6] after DiT released
 
-        # -- 16. Separate final AV latent (workflow node 22) --
-        # Pass 2 uses output index 0 (output) - workflow wires slot 0 to node 22
+        # ── Stage 16: Separate final AV latent (node 22) ─────────────────────
         final_video_lat, final_audio_lat = separate_av_latent(sample_out_2, output_index=0)
         del sample_out_2
-        mem.soft_cleanup()
+        mem.stage_cleanup("separate_av_pass2")                 # [MEM-5]
 
-        # -- 17. LTXDirectorCropGuides (workflow node 54) --
-        # Takes Guide132's pos/neg + pass2 separated video_latent
-        # Output latent (slot 2) goes to VAEDecode
+        # ── Stage 17: Director Crop Guides (node 54) ─────────────────────────
         pos_crop54, neg_crop54, lat_crop54 = run_director_crop_guides(
-            pos_cond=pos_g2,
-            neg_cond=neg_g2,
-            latent=final_video_lat,
-            prefer_standard=no_director_data,
-        )
+            pos_cond=pos_g2, neg_cond=neg_g2,
+            latent=final_video_lat, prefer_standard=no_director_data)
         del pos_g2, neg_g2, final_video_lat, pos_crop54, neg_crop54
-        mem.aggressive_cleanup()
-        mem.ram_cleanup()
-        if not mem.is_ram_safe(required_gb=3.0):
-            print(f"  WARNING: System RAM critically low before decode "
-                  f"({mem.cpu_available_gb():.2f} GB available < 3.0 GB).")
+        mem.aggressive_cleanup()                               # [MEM-5]
+        mem.ram_cleanup()                                      # [MEM-5] OS-level RAM reclaim
 
-        # -- 18. Decode video (workflow node 1: VAEDecode) --
-        # Uses CropGuides54's latent output (slot 2)
+        # [MEM-6] RAM safety check before decode
+        if not mem.is_ram_safe(required_gb=3.0):
+            print(f"  ⚠ RAM critically low ({mem.cpu_available_gb():.2f} GB) before decode!")
+
+        # ── Stage 17b: BUG-D FIX — evict cached VAEs before decode ───────────
+        # When ModelCache is ON, video_vae (~2 GB) and audio_vae (~1 GB) have been
+        # resident in VRAM since Stage 2/7 of this chunk.  After releasing the DiT
+        # at Stage 15, we still have ~3 GB of stuck VAE weights, leaving only ~1.4 GB
+        # free — not enough for the VAEDecode scratch allocation that crashes the session.
+        #
+        # Fix: evict both VAEs now, run a full ComfyUI + VRAM sweep, then reload
+        # them fresh below.  The reload is cheap (< 1s from VRAM-backed CPU memory)
+        # and the total VRAM needed for decode drops from ~15 GB to ~3–4 GB.
+        if MODEL_CACHE is not None:
+            MODEL_CACHE.evict_vaes()       # explicit del + aggressive_cleanup
+            _clear_comfy_model_cache()     # drop ComfyUI's ModelPatcher references too
+            mem.aggressive_cleanup()
+            print_vram_usage("  ")         # verify VRAM freed before loading decode VAEs
+            # Reload video_vae fresh for decode — loaded ONLY at decode time
+            print("  Reloading video VAE for decode (fresh after eviction)...")
+            video_vae = load_video_vae()
+            # Reload audio_vae fresh for audio decode
+            print("  Reloading audio VAE for decode (fresh after eviction)...")
+            audio_vae = load_audio_vae()
+            mem.stage_cleanup("reload_vaes_for_decode")
+
+        # [MEM-6] RAM safety check before decode
+        if not mem.is_ram_safe(required_gb=3.0):
+            print(f"  ⚠ RAM critically low ({mem.cpu_available_gb():.2f} GB) before decode!")
+
+        # ── Stage 18: Decode video ─────────────────────────────────────────────
+        print_vram_usage("  ")                                 # [MEM-6] before decode
         frames_cpu = decode_video_latent(lat_crop54, video_vae)
         del lat_crop54
+        mem.stage_cleanup("decode_video")                      # [MEM-5]
 
-        # -- 19. Decode audio (workflow node 24: LTXVAudioVAEDecode) --
+        # ── Stage 19: Decode audio ─────────────────────────────────────────────
         audio_cpu = decode_audio_latent(final_audio_lat, audio_vae)
         del final_audio_lat
+        mem.stage_cleanup("decode_audio")                      # [MEM-5]
 
-        # -- 20. Unload VAEs --
-        del video_vae, audio_vae
-        mem.cleanup()
+        # ── Stage 20: Unload VAEs ──────────────────────────────────────────────
+        # BUG-D FIX: VAEs were previously kept in ModelCache permanently.
+        # Now we evict them before decode (above) and evict again here after decode
+        # so they do NOT accumulate across chunks.  They reload at the start of each
+        # chunk in Stage 2/7 — load time is ~0.5s from disk (cached by OS).
+        if MODEL_CACHE is not None:
+            MODEL_CACHE.evict_vaes()
+            _clear_comfy_model_cache()
+            mem.aggressive_cleanup()
+        else:
+            del video_vae, audio_vae
+            mem.aggressive_cleanup()
+        mem.stage_cleanup("vae_unload_post_decode")            # [MEM-5]
 
-    # -- 21. Save chunk to disk --
-    chunk_path = save_chunk_to_disk(
-        frames_cpu, audio_cpu, idx, fps, width, height
-    )
-
-    # Release CPU frame buffers
+    # ── Stage 21: Save chunk to disk ──────────────────────────────────────────
+    chunk_path = save_chunk_to_disk(frames_cpu, audio_cpu, idx, fps, width, height)
     del frames_cpu, audio_cpu
-    gc.collect()
+    gc.collect(); _malloc_trim()                               # [MEM-5] OS RAM after frames deleted
+
+    # [MEM-7] Optional shot quality metrics log
+    if CONFIG["enable_memory_logging"] and os.path.exists(chunk_path):
+        score, metrics = calculate_shot_metrics(chunk_path)
+        print(f"  📊 Chunk quality: score={score:.3f}  "
+              f"sharp={metrics.get('sharpness',0):.0f}  "
+              f"bright={metrics.get('brightness',0):.0f}  "
+              f"motion_std={metrics.get('motion_std',0):.2f}")
+
+    # [MEM-7] Optional face restoration
+    if CONFIG.get("face_restoration", False):
+        chunk_path = apply_face_restoration(chunk_path)
 
     if CONFIG["enable_memory_logging"]:
-        print(f"  GPU after  chunk {idx}: {mem.gpu_free_gb():.2f} GB free")
+        print(f"  GPU after chunk {idx}: {mem.gpu_free_gb():.2f} GB free")
+        print_vram_usage("  ")                                 # [MEM-6] final per-chunk VRAM bar
 
     if CONFIG["cleanup_after_chunk"]:
-        mem.aggressive_cleanup()
+        mem.aggressive_cleanup()                               # [MEM-5] end-of-chunk full sweep
 
-    return {
-        "chunk_index": idx,
-        "start_frame": start_frame,
-        "num_frames":  num_frames,
-        "fps":         fps,
-        "path":        chunk_path,
-    }
+    return {"chunk_index": idx, "start_frame": start_frame,
+            "num_frames": num_frames, "fps": fps, "path": chunk_path}
 
 
 # =============================================================================
@@ -2899,22 +2331,20 @@ def adaptive_chunk_generator(
     checkpoint: Dict,
 ) -> List[Dict]:
     """
-    Iterate over chunks with OOM recovery and checkpoint-based resume.
+    Iterate chunks with OOM recovery and checkpoint-based resume.
 
-    On CUDA OOM:
-        1. Catch exception
-        2. Print diagnostic
-        3. Aggressive cleanup
-        4. Reduce chunk size by factor (0.75 → 0.5)
-        5. Re-split the remaining chunks
-        6. Retry (up to MAX_OOM_RETRIES)
+    [MEM-6] Pre-chunk VRAM bar + OOM guard before every attempt.
+    [MEM-2] MODEL_CACHE.evict_all() on OOM to guarantee clean state.
 
-    Completed chunks are skipped if already present in checkpoint.
-    Returns list of completed chunk metadata dicts.
+    OOM recovery tiers:
+        retry 1 → reduce chunk to 0.75×
+        retry 2 → reduce chunk to 0.50×, evict model cache
+        retry 3 → evict all caches, drop to t4_ultra_safe sigmas
+        > max   → record as failed, continue to next chunk
     """
-    max_retries   = CONFIG["max_oom_retries"]
-    auto_reduce   = CONFIG["auto_reduce_chunk_on_oom"]
-    completed     = []
+    max_retries  = CONFIG["max_oom_retries"]
+    auto_reduce  = CONFIG["auto_reduce_chunk_on_oom"]
+    completed    = []
     current_chunks = list(chunks)
     i = 0
 
@@ -2922,54 +2352,43 @@ def adaptive_chunk_generator(
         chunk_desc = current_chunks[i]
         idx = chunk_desc["chunk_index"]
 
-        # ── Resume check: skip already-completed chunks ───────────────────────
+        # ── Resume: skip already-completed chunks ─────────────────────────────
         if idx in checkpoint.get("completed_chunks", []):
-            existing_path = os.path.join(
-                CONFIG["workspace_dir"], "chunks", f"chunk_{idx:04d}.mp4"
-            )
-            if os.path.exists(existing_path) and os.path.getsize(existing_path) > 0:
+            existing = os.path.join(CONFIG["workspace_dir"], "chunks", f"chunk_{idx:04d}.mp4")
+            if os.path.exists(existing) and os.path.getsize(existing) > 0:
                 print(f"  ↷ Chunk {idx:04d} already complete — skipping.")
-                completed.append({
-                    "chunk_index": idx,
-                    "start_frame": chunk_desc["start_frame"],
-                    "num_frames":  chunk_desc["num_frames"],
-                    "fps":         fps,
-                    "path":        existing_path,
-                })
+                completed.append({"chunk_index": idx,
+                                   "start_frame": chunk_desc["start_frame"],
+                                   "num_frames":  chunk_desc["num_frames"],
+                                   "fps": fps, "path": existing})
                 i += 1
                 continue
 
-        # ── Attempt generation with OOM recovery ─────────────────────────────
         retries = 0
         success = False
         current_num_frames = chunk_desc["num_frames"]
 
         while retries <= max_retries and not success:
             try:
-                print(f"\n{'='*60}")
-                print(f"[Chunk {idx+1:02d}]  frames {chunk_desc['start_frame']}–"
-                      f"{chunk_desc['start_frame']+current_num_frames-1}  "
-                      f"({current_num_frames} frames)")
-                if CONFIG["enable_memory_logging"]:
-                    mem.print_memory("  ")
-                print(f"{'='*60}")
+                # [MEM-6] Print VRAM state at the start of every attempt
+                print(f"\n{'='*62}")
+                print(f"  [Chunk {idx+1:03d}]  attempt {retries+1}/{max_retries+1}"
+                      f"  frames={current_num_frames}")
+                print(f"{'='*62}")
+                print_vram_usage("  ")
 
-                # Use potentially-reduced frame count
+                # [MEM-6] Guard: require at least 2 GB free before attempting
+                mem.pre_op_guard(f"chunk_{idx}_attempt_{retries}", required_gb=2.0)
+
                 work_desc = {**chunk_desc, "num_frames": current_num_frames}
                 result = generate_chunk(
                     chunk_desc=work_desc,
-                    pos_cond=pos_cond,
-                    neg_cond=neg_cond,
+                    pos_cond=pos_cond, neg_cond=neg_cond,
                     loaded_image_tuple=loaded_image_tuple,
-                    image_strength=image_strength,
-                    image_bypass=image_bypass,
-                    width=width,
-                    height=height,
-                    fps=fps,
-                    profile=profile,
-                    global_seed=global_seed,
+                    image_strength=image_strength, image_bypass=image_bypass,
+                    width=width, height=height, fps=fps,
+                    profile=profile, global_seed=global_seed,
                 )
-
                 completed.append(result)
                 checkpoint["completed_chunks"].append(idx)
                 save_checkpoint(checkpoint)
@@ -2978,41 +2397,44 @@ def adaptive_chunk_generator(
 
             except torch.cuda.OutOfMemoryError as oom:
                 retries += 1
-                print(f"\n  {'='*50}")
-                print(f"  ERROR TYPE   : CUDA OutOfMemoryError")
-                print(f"  CAUSE        : {str(oom)[:200]}")
-                print(f"  CURRENT CHUNK: {idx}")
-                print(f"  GPU MEMORY   : {mem.gpu_free_gb():.2f} GB free")
-                print(f"  RETRY        : {retries}/{max_retries}")
+                print(f"\n  {'!'*50}")
+                print(f"  OOM  chunk={idx}  retry={retries}/{max_retries}")
+                print(f"  {str(oom)[:200]}")
+                print(f"  VRAM free now: {mem.gpu_free_gb():.2f} GB")
 
-                # Release cached DiT model before cleanup to free VRAM
+                # Tier 1: release DiT cache + aggressive cleanup
                 release_dit_model()
                 mem.aggressive_cleanup()
 
+                # Tier 2: evict entire model cache on second OOM
+                if retries >= 2 and MODEL_CACHE is not None:
+                    print("  [MEM-2] Evicting full ModelCache (tier-2 OOM)")
+                    MODEL_CACHE.evict_all()
+
+                print_vram_usage("  ")                         # show state after cleanup
+
                 if not auto_reduce or retries > max_retries:
                     if retries > max_retries:
-                        print(f"\n  Generation stopped safely after {max_retries} OOM retries.")
-                        print("  SUGGESTED ACTION: Reduce resolution or decrease chunk_frames.")
+                        print(f"  Generation stopped after {max_retries} OOM retries.")
+                        print("  SUGGESTED: reduce CHUNK_FRAMES or switch to t4_ultra_safe.")
                         checkpoint["failed_chunks"].append(idx)
                         save_checkpoint(checkpoint)
                     break
 
-                # Reduce chunk size: 0.75× on first retry, 0.5× on second
+                # Reduce chunk size: 0.75× → 0.5×
                 reduction = 0.75 if retries == 1 else 0.5
                 raw_reduced = max(9, int(current_num_frames * reduction))
                 current_num_frames = normalize_ltx_frame_count(raw_reduced, fps)
-                print(f"  Reducing chunk size to {current_num_frames} frames and retrying...")
+                print(f"  Retrying with {current_num_frames} frames ({reduction*100:.0f}%)...")
 
             except Exception as e:
-                print(f"\n  ERROR TYPE   : {type(e).__name__}")
-                print(f"  CAUSE        : {str(e)[:300]}")
-                print(f"  CURRENT CHUNK: {idx}")
-                print(f"  TRACEBACK    :\n{traceback.format_exc()}")
+                print(f"\n  ERROR  {type(e).__name__}: {str(e)[:300]}")
+                print(f"  {traceback.format_exc()[:600]}")
                 checkpoint["failed_chunks"].append(idx)
                 save_checkpoint(checkpoint)
                 release_dit_model()
                 mem.aggressive_cleanup()
-                break  # Non-OOM errors: skip chunk, continue
+                break
 
         i += 1
 
@@ -3026,16 +2448,7 @@ def adaptive_chunk_generator(
 def _checkpoint_path() -> str:
     return os.path.join(CONFIG["workspace_dir"], "checkpoint.json")
 
-
-def init_checkpoint(
-    fps: int,
-    total_frames: int,
-    seed: int,
-    width: int,
-    height: int,
-    job_id: Optional[str] = None,
-) -> Dict:
-    """Create a fresh checkpoint dict."""
+def init_checkpoint(fps, total_frames, seed, width, height, job_id=None) -> Dict:
     return {
         "job_id":           job_id or f"ltx23_{int(time.time())}",
         "fps":              fps,
@@ -3048,9 +2461,7 @@ def init_checkpoint(
         "updated_at":       time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
-
 def save_checkpoint(checkpoint: Dict):
-    """Persist checkpoint dict to disk."""
     checkpoint["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     Path(CONFIG["workspace_dir"]).mkdir(parents=True, exist_ok=True)
     tmp = _checkpoint_path() + ".tmp"
@@ -3058,9 +2469,7 @@ def save_checkpoint(checkpoint: Dict):
         json.dump(checkpoint, f, indent=2)
     os.replace(tmp, _checkpoint_path())
 
-
 def load_checkpoint() -> Optional[Dict]:
-    """Load checkpoint from disk, or return None if not found."""
     p = _checkpoint_path()
     if not os.path.exists(p):
         return None
@@ -3071,182 +2480,82 @@ def load_checkpoint() -> Optional[Dict]:
         print(f"  ⚠ Could not load checkpoint: {e}")
         return None
 
-
-def get_or_create_checkpoint(
-    fps: int,
-    total_frames: int,
-    seed: int,
-    width: int,
-    height: int,
-) -> Dict:
-    """
-    Load existing checkpoint (if resume enabled and checkpoint exists)
-    or create a fresh one.
-    """
+def get_or_create_checkpoint(fps, total_frames, seed, width, height) -> Dict:
     if CONFIG["resume"]:
         existing = load_checkpoint()
         if existing is not None:
-            # Validate that the checkpoint matches the current job configuration
             if (existing.get("fps") == fps
                     and existing.get("total_frames") == total_frames
                     and existing.get("resolution") == [width, height]):
-                completed = existing.get("completed_chunks", [])
-                print(f"  ↷ Resuming from checkpoint: {len(completed)} chunks already complete.")
+                done = len(existing.get("completed_chunks", []))
+                print(f"  ↷ Resuming: {done} chunks already complete.")
                 return existing
             else:
-                print("  ⚠ Checkpoint exists but configuration mismatch — starting fresh.")
-
+                print("  ⚠ Checkpoint config mismatch — starting fresh.")
     cp = init_checkpoint(fps, total_frames, seed, width, height)
     save_checkpoint(cp)
     return cp
 
-
 # =============================================================================
-# SECTION 21 — VIDEO ASSEMBLY (FFmpeg concat)
+# SECTION 21 — VIDEO ASSEMBLY  (FFmpeg concat)
 # =============================================================================
 
-def assemble_chunks_to_video(
-    completed_chunks: List[Dict],
-    output_path: str,
-    fps: int,
-) -> bool:
-    """
-    Concatenate chunk MP4 files into the final video using FFmpeg stream-copy.
-    Stream-copy avoids re-encoding every frame, which would:
-        - waste time
-        - increase RAM usage (decoding all frames to re-encode)
-        - degrade quality
-
-    If any chunk has mismatched codec/resolution (making stream-copy unsafe),
-    falls back to a single re-encode pass.
-
-    The full final video is NEVER loaded into Python/RAM.
-    Returns True on success.
-    """
+def assemble_chunks_to_video(completed_chunks: List[Dict], output_path: str, fps: int) -> bool:
     if not completed_chunks:
-        print("  ✗ No completed chunks to assemble.")
-        return False
-
+        print("  ✗ No completed chunks."); return False
     Path(os.path.dirname(output_path)).mkdir(parents=True, exist_ok=True)
-
-    # Sort by chunk index to guarantee correct frame order
-    sorted_chunks = sorted(completed_chunks, key=lambda c: c["chunk_index"])
-
-    # Write ffmpeg concat list file (streamed read, no RAM load)
+    sorted_chunks   = sorted(completed_chunks, key=lambda c: c["chunk_index"])
     concat_list_path = os.path.join(CONFIG["workspace_dir"], "concat_list.txt")
     with open(concat_list_path, "w") as f:
         for chunk in sorted_chunks:
-            # ffmpeg requires escaped paths
             safe_path = chunk["path"].replace("'", "'\\''")
             f.write(f"file '{safe_path}'\n")
-
     print(f"\n  Assembling {len(sorted_chunks)} chunks → {output_path}")
 
-    # ── Attempt 1: stream-copy concat (fastest, no quality loss) ─────────────
-    cmd_copy = [
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", concat_list_path,
-        "-c", "copy",
-        output_path,
-    ]
-    result = subprocess.run(cmd_copy, capture_output=True, text=True)
-    if result.returncode == 0:
-        size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        print(f"  ✓ Assembly complete (stream-copy): {output_path} ({size_mb:.1f} MB)")
+    # Attempt 1: stream-copy (lossless, fastest)
+    r = subprocess.run(
+        ["ffmpeg","-y","-f","concat","-safe","0","-i",concat_list_path,"-c","copy",output_path],
+        capture_output=True, text=True)
+    if r.returncode == 0:
+        print(f"  ✓ Assembly (stream-copy): {os.path.getsize(output_path)/(1024*1024):.1f} MB")
         return True
+    print(f"  Stream-copy failed ({r.stderr.strip()[:120]}), re-encoding...")
 
-    print(f"  Stream-copy failed ({result.stderr.strip()[:200]}), trying re-encode...")
-
-    # ── Attempt 2: re-encode concat ───────────────────────────────────────────
-    cmd_reencode = [
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", concat_list_path,
-        "-vcodec", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-crf", "18",
-        "-preset", "fast",
-        "-acodec", "aac",
-        "-b:a", "192k",
-        output_path,
-    ]
-    result2 = subprocess.run(cmd_reencode, capture_output=True, text=True)
-    if result2.returncode == 0:
-        size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        print(f"  ✓ Assembly complete (re-encode): {output_path} ({size_mb:.1f} MB)")
+    # Attempt 2: re-encode
+    r2 = subprocess.run(
+        ["ffmpeg","-y","-f","concat","-safe","0","-i",concat_list_path,
+         "-vcodec","libx264","-pix_fmt","yuv420p","-crf","18","-preset","fast",
+         "-acodec","aac","-b:a","192k",output_path],
+        capture_output=True, text=True)
+    if r2.returncode == 0:
+        print(f"  ✓ Assembly (re-encode): {os.path.getsize(output_path)/(1024*1024):.1f} MB")
         return True
-
-    print(f"  ✗ Assembly failed:\n{result2.stderr.strip()[:400]}")
+    print(f"  ✗ Assembly failed:\n{r2.stderr.strip()[:300]}")
     return False
 
-
 # =============================================================================
-# SECTION 22 — AUDIO SYNCHRONIZATION
+# SECTION 22 — AUDIO SYNCHRONISATION
 # =============================================================================
 
-def assemble_video_with_audio(
-    video_path: str,
-    audio_path: Optional[str],
-    output_path: str,
-    fps: int,
-    total_frames: int,
-    audio_start_seconds: float = 0.0,
-) -> bool:
-    """
-    Mux the assembled video with the original audio track using exact
-    frame-based timing to prevent cumulative drift between chunks.
-
-    Workflow audio notes:
-        - Audio track: "Late night trap.mp3"
-        - Trim start: ~18.6s from audio start (446.92/24 fps)
-        - Total video duration: 31.5s @ 24 fps = 756 frames
-
-    If no external audio is provided, the video's generated audio track
-    (hallucinated by the LTX audio VAE per-chunk and concatenated) is used.
-
-    Returns True on success.
-    """
+def assemble_video_with_audio(video_path, audio_path, output_path,
+                                fps, total_frames, audio_start_seconds=0.0) -> bool:
     if audio_path is None or not os.path.exists(audio_path):
-        # No external audio — just rename/copy the assembled video
         if video_path != output_path:
             shutil.copy2(video_path, output_path)
         print(f"  ✓ Output (no external audio): {output_path}")
         return True
-
     video_duration = total_frames / fps
-    audio_duration = video_duration  # trim to exactly the video length
-
-    print(f"  Muxing audio: start={audio_start_seconds:.3f}s, duration={audio_duration:.3f}s")
-
-    cmd = [
-        "ffmpeg", "-y",
-        # Video input
-        "-i", video_path,
-        # Audio input with precise seek
-        "-ss", str(audio_start_seconds),
-        "-t",  str(audio_duration),
-        "-i", audio_path,
-        # Use video stream from input 0, audio from input 1
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        # Ensure audio is exactly as long as video
-        "-shortest",
-        output_path,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
-        size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        print(f"  ✓ Audio sync complete: {output_path} ({size_mb:.1f} MB)")
+    print(f"  Muxing audio: start={audio_start_seconds:.3f}s dur={video_duration:.3f}s")
+    r = subprocess.run(
+        ["ffmpeg","-y","-i",video_path,
+         "-ss",str(audio_start_seconds),"-t",str(video_duration),"-i",audio_path,
+         "-map","0:v:0","-map","1:a:0","-c:v","copy","-c:a","aac","-b:a","192k",
+         "-shortest",output_path],
+        capture_output=True, text=True)
+    if r.returncode == 0:
+        print(f"  ✓ Audio sync: {os.path.getsize(output_path)/(1024*1024):.1f} MB")
         return True
-
-    print(f"  ✗ Audio mux failed: {result.stderr.strip()[:300]}")
-    # Fallback: output without external audio
+    print(f"  ✗ Audio mux failed: {r.stderr.strip()[:200]}")
     shutil.copy2(video_path, output_path)
     return False
 
@@ -3256,172 +2565,91 @@ def assemble_video_with_audio(
 # =============================================================================
 
 def validate_output_video(output_path: str, expected_frames: int, fps: int) -> bool:
-    """
-    Use ffprobe to verify the final output video without loading it into RAM.
-    Checks frame count, duration, codec, and resolution.
-    """
     if not os.path.exists(output_path):
-        print(f"  ✗ Output video not found: {output_path}")
-        return False
-
-    size_mb = os.path.getsize(output_path) / (1024 * 1024)
-
+        print(f"  ✗ Output not found: {output_path}"); return False
+    size_mb = os.path.getsize(output_path) / (1024*1024)
     try:
-        probe_cmd = [
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_streams", "-show_format",
-            output_path,
-        ]
-        result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
-        info = json.loads(result.stdout)
-
-        video_stream = next(
-            (s for s in info.get("streams", []) if s.get("codec_type") == "video"),
-            None,
-        )
-        if video_stream is None:
-            print("  ✗ No video stream found in output.")
-            return False
-
-        nb_frames = int(video_stream.get("nb_frames", 0))
-        codec     = video_stream.get("codec_name", "unknown")
-        width_out = video_stream.get("width", 0)
-        height_out = video_stream.get("height", 0)
-        duration  = float(info.get("format", {}).get("duration", 0))
-
-        print(f"\n  Output video validation:")
-        print(f"    Path     : {output_path}")
-        print(f"    Size     : {size_mb:.1f} MB")
-        print(f"    Codec    : {codec}")
-        print(f"    Res      : {width_out}×{height_out}")
-        print(f"    Frames   : {nb_frames} (expected ≈{expected_frames})")
-        print(f"    Duration : {duration:.2f}s (expected ≈{expected_frames/fps:.2f}s)")
-
+        r = subprocess.run(
+            ["ffprobe","-v","quiet","-print_format","json",
+             "-show_streams","-show_format",output_path],
+            capture_output=True, text=True, check=True)
+        info = json.loads(r.stdout)
+        vs = next((s for s in info.get("streams",[]) if s.get("codec_type")=="video"), None)
+        if vs is None:
+            print("  ✗ No video stream in output."); return False
+        nb_frames = int(vs.get("nb_frames", 0))
+        duration  = float(info.get("format",{}).get("duration", 0))
+        print(f"\n  Output validation:")
+        print(f"    Size    : {size_mb:.1f} MB")
+        print(f"    Codec   : {vs.get('codec_name','?')}")
+        print(f"    Res     : {vs.get('width',0)}×{vs.get('height',0)}")
+        print(f"    Frames  : {nb_frames} (expected ≈{expected_frames})")
+        print(f"    Duration: {duration:.2f}s (expected ≈{expected_frames/fps:.2f}s)")
         ok = nb_frames > 0 and duration > 0
-        print(f"  {'✓' if ok else '✗'} Output validation {'passed' if ok else 'failed'}.")
+        print(f"  {'✓' if ok else '✗'} Validation {'passed' if ok else 'FAILED'}.")
         return ok
-
     except Exception as e:
-        print(f"  ⚠ Output validation error: {e}")
-        print(f"    File exists: {size_mb:.1f} MB")
-        return True  # file exists, assume ok
-
+        print(f"  ⚠ Validation error: {e} (file={size_mb:.1f} MB)")
+        return True
 
 # =============================================================================
 # SECTION 24 — PREVIEW MODE
 # =============================================================================
 
-def generate_preview(
-    image_path: Optional[str],
-    prompt: str,
-    fps: int,
-    width: int,
-    height: int,
-    seed: int,
-    profile: Dict,
-    preview_duration: float = 3.0,
-) -> Optional[str]:
-    """
-    Generate a short preview clip using the same pipeline but fewer frames.
-    Uses the configured quality profile at potentially reduced resolution.
-    The preview is generated and saved, then all memory is cleared.
-
-    Returns the preview output path, or None on failure.
-    """
+def generate_preview(image_path, prompt, fps, width, height, seed, profile,
+                      preview_duration=3.0) -> Optional[str]:
     preview_frames = normalize_ltx_frame_count(round(preview_duration * fps), fps)
-    preview_out = os.path.join(CONFIG["output_dir"], "preview.mp4")
-
+    preview_out    = os.path.join(CONFIG["output_dir"], "preview.mp4")
     print(f"\n  PREVIEW MODE: {preview_frames} frames ({preview_duration:.1f}s)")
-
-    # Load image
     loaded_image, img_strength, img_bypass = load_input_image(image_path, width, height)
-
-    # Build conditioning
     pos_cond, neg_cond = build_text_conditioning(prompt, fps)
-
-    # Single preview chunk
-    preview_desc = {
-        "chunk_index": 0,
-        "start_frame": 0,
-        "num_frames": preview_frames,
-        "fps": fps,
-        "path": None,
-    }
-
+    preview_desc = {"chunk_index":0,"start_frame":0,"num_frames":preview_frames,
+                    "fps":fps,"path":None}
     try:
         mem.cleanup()
         result = generate_chunk(
-            chunk_desc=preview_desc,
-            pos_cond=pos_cond,
-            neg_cond=neg_cond,
-            loaded_image_tuple=loaded_image,
-            image_strength=img_strength,
-            image_bypass=img_bypass,
-            width=width,
-            height=height,
-            fps=fps,
-            profile=profile,
-            global_seed=seed,
-        )
-
-        # Move chunk to preview output location
+            chunk_desc=preview_desc, pos_cond=pos_cond, neg_cond=neg_cond,
+            loaded_image_tuple=loaded_image, image_strength=img_strength,
+            image_bypass=img_bypass, width=width, height=height,
+            fps=fps, profile=profile, global_seed=seed)
         if result["path"] and os.path.exists(result["path"]):
             Path(CONFIG["output_dir"]).mkdir(parents=True, exist_ok=True)
             shutil.move(result["path"], preview_out)
             print(f"  ✓ Preview saved: {preview_out}")
             display_video_safe(preview_out)
         else:
-            print("  ✗ Preview generation failed.")
             preview_out = None
-
     finally:
         del loaded_image, pos_cond, neg_cond
         _CONDITIONING_CACHE.clear()
         mem.aggressive_cleanup()
-
     return preview_out
-
 
 # =============================================================================
 # SECTION 25 — SAFE VIDEO DISPLAY
 # =============================================================================
 
 def display_video_safe(video_path: str, max_size_mb: float = 50.0):
-    """
-    Display a video in Colab without loading the entire file into RAM.
-    Falls back to a file-size warning if the video exceeds max_size_mb.
-    Never uses open(path, 'rb').read() on large files.
-    """
     if not os.path.exists(video_path):
-        print(f"  Video not found: {video_path}")
-        return
-
-    size_mb = os.path.getsize(video_path) / (1024 * 1024)
-
+        print(f"  Video not found: {video_path}"); return
+    size_mb = os.path.getsize(video_path) / (1024*1024)
     if size_mb > max_size_mb:
-        print(f"  Video is {size_mb:.1f} MB — too large for inline display.")
-        print(f"  Download it with: files.download('{video_path}')")
+        print(f"  Video {size_mb:.1f} MB — too large for inline display.")
+        print(f"  Download: files.download('{video_path}')")
         return
-
-    # For small files (preview, short clips), use base64 inline display
     from base64 import b64encode
-    # Read in chunks to avoid single huge allocation
     chunks_b64 = []
     with open(video_path, "rb") as f:
         while True:
             block = f.read(65536)
-            if not block:
-                break
+            if not block: break
             chunks_b64.append(block)
     video_b64 = b64encode(b"".join(chunks_b64)).decode()
     del chunks_b64
-
     display(HTML(f"""
     <video width=640 controls autoplay loop muted>
       <source src="data:video/mp4;base64,{video_b64}" type="video/mp4">
-    </video>
-    """))
+    </video>"""))
     del video_b64
 
 
@@ -3429,141 +2657,104 @@ def display_video_safe(video_path: str, max_size_mb: float = 50.0):
 # SECTION 26 — JOB REPORT
 # =============================================================================
 
-def write_job_report(
-    output_path: str,
-    total_frames: int,
-    fps: int,
-    width: int,
-    height: int,
-    chunk_size: int,
-    completed_chunks: List[Dict],
-    failed_chunks: List[int],
-    generation_start_time: float,
-    seed: int,
-):
-    """
-    Write a JSON job report to /content/ltx23_output/job_report.json.
-    Contains full provenance: hardware, timing, model versions, chunk info.
-    """
+def write_job_report(output_path, total_frames, fps, width, height,
+                      chunk_size, completed_chunks, failed_chunks,
+                      generation_start_time, seed):
     elapsed = time.time() - generation_start_time
-    actual_duration = total_frames / fps
-
-    report = {
-        "gpu":                    _GPU_INFO.get("device_name", "unknown"),
-        "vram_total_gb":          round(_GPU_INFO.get("vram_total_gb", 0), 2),
-        "torch_version":          torch.__version__,
-        "cuda_version":           getattr(torch.version, "cuda", "N/A"),
-        "models": {
-            "dit":            MODELS["dit"],
-            "text_encoder_1": MODELS["text_encoder_1"],
-            "text_encoder_2": MODELS["text_encoder_2"],
-            "audio_vae":      MODELS["audio_vae"],
-            "video_vae":      MODELS["video_vae"],
-            "tiny_vae":       MODELS["tiny_vae"],
-            "upscaler":       MODELS["upscaler"],
-            "loras": {k: {"file": MODELS[k], "strength": LORA_STRENGTHS[k]}
-                      for k in LORA_STRENGTHS},
-        },
+    report  = {
+        "gpu":                   _GPU_INFO.get("device_name","unknown"),
+        "vram_total_gb":         round(_GPU_INFO.get("vram_total_gb",0), 2),
+        "torch_version":         torch.__version__,
+        "cuda_version":          getattr(torch.version,"cuda","N/A"),
+        "models":                {k: MODELS[k] for k in MODELS},
+        "lora_strengths":        LORA_STRENGTHS,
+        "lora_enabled":          LORA_ENABLED,
         "workflow": {
-            "fps":              fps,
-            "sampler":          WORKFLOW_SAMPLER_PASS1,
-            "scheduler":        WORKFLOW_SCHEDULER,
-            "steps":            WORKFLOW_STEPS,
-            "cfg":              WORKFLOW_CFG,
+            "fps":       fps, "sampler": WORKFLOW_SAMPLER_PASS1,
+            "scheduler": WORKFLOW_SCHEDULER, "steps": WORKFLOW_STEPS,
+            "cfg":       WORKFLOW_CFG, "sigma_mode": CONFIG["sigma_preset_mode"],
         },
-        "resolution":             f"{width}x{height}",
-        "fps":                    fps,
-        "seed":                   seed,
-        "requested_duration_s":   CONFIG["duration_seconds"],
-        "actual_duration_s":      round(actual_duration, 3),
-        "total_frames":           total_frames,
-        "chunk_size_frames":      chunk_size,
-        "chunks_completed":       len(completed_chunks),
-        "chunks_failed":          len(failed_chunks),
-        "failed_chunk_indices":   failed_chunks,
-        "peak_gpu_memory_gb":     round(mem.gpu_peak_gb(), 3),
-        "generation_time_seconds": round(elapsed, 1),
-        "output_path":            output_path,
-        "generated_at":           time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "resolution":            f"{width}x{height}",
+        "quality_mode":          CONFIG["quality_mode"],
+        "fps":                   fps,
+        "seed":                  seed,
+        "requested_duration_s":  CONFIG["duration_seconds"],
+        "actual_duration_s":     round(total_frames/fps, 3),
+        "total_frames":          total_frames,
+        "chunk_size_frames":     chunk_size,
+        "chunks_completed":      len(completed_chunks),
+        "chunks_failed":         len(failed_chunks),
+        "failed_chunk_indices":  failed_chunks,
+        "peak_gpu_memory_gb":    round(mem.gpu_peak_gb(), 3),
+        "generation_time_s":     round(elapsed, 1),
+        "generation_time_min":   round(elapsed/60, 2),
+        "output_path":           output_path,
+        "generated_at":          time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "improvements_applied":  ["MEM-1","MEM-2","MEM-3","MEM-4",
+                                   "MEM-5","MEM-6","MEM-7","MEM-8"],
     }
-
     report_path = os.path.join(CONFIG["output_dir"], "job_report.json")
     Path(CONFIG["output_dir"]).mkdir(parents=True, exist_ok=True)
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2)
-
-    print(f"\n  Job report: {report_path}")
-    print(f"  Peak GPU memory : {report['peak_gpu_memory_gb']:.3f} GB")
-    print(f"  Generation time : {elapsed:.1f}s ({elapsed/60:.1f} min)")
-    print(f"  Chunks completed: {report['chunks_completed']}")
+    print(f"\n  Job report  : {report_path}")
+    print(f"  Peak VRAM   : {report['peak_gpu_memory_gb']:.3f} GB")
+    print(f"  Gen time    : {elapsed:.1f}s ({elapsed/60:.1f} min)")
+    print(f"  Completed   : {report['chunks_completed']} chunks")
     if failed_chunks:
-        print(f"  Chunks failed   : {failed_chunks}")
-
+        print(f"  Failed      : {failed_chunks}")
 
 # =============================================================================
 # SECTION 27 — FINAL CLEANUP
 # =============================================================================
 
 def cleanup_temp_files(completed_chunks: List[Dict], keep_chunks: bool = False):
-    """
-    Remove temporary chunk files after successful final assembly.
-    Preserves failed chunks and the concat list for debugging.
-    Never deletes the final output video.
-    """
     if keep_chunks:
-        print("  Keeping temp chunks (KEEP_TEMP_CHUNKS=True).")
-        return
-
+        print("  Keeping temp chunks (KEEP_TEMP_CHUNKS=True)."); return
     removed = 0
     for chunk in completed_chunks:
         path = chunk.get("path")
         if path and os.path.exists(path):
             try:
-                os.remove(path)
-                removed += 1
+                os.remove(path); removed += 1
             except Exception as e:
                 print(f"  ⚠ Could not remove {path}: {e}")
-
-    # Remove concat list
     concat_list = os.path.join(CONFIG["workspace_dir"], "concat_list.txt")
     if os.path.exists(concat_list):
         os.remove(concat_list)
-
-    print(f"  ✓ Removed {removed} temporary chunk files.")
-
+    print(f"  ✓ Removed {removed} temp chunk files.")
 
 def final_memory_report():
-    """Print end-of-job memory summary."""
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 62)
     print("FINAL MEMORY REPORT")
-    print("=" * 60)
+    print("=" * 62)
     mem.print_memory()
-    print(f"  Peak GPU usage  : {mem.gpu_peak_gb():.3f} GB")
-    print("=" * 60)
+    print_vram_usage()
+    print(f"  Peak GPU: {mem.gpu_peak_gb():.3f} GB")
+    print("=" * 62)
 
 
 # =============================================================================
 # SECTION 28 — MAIN ENTRY POINT
 # =============================================================================
 
-def print_banner(total_frames: int, fps: int, duration_s: float,
-                 width: int, height: int, chunk_size: int, n_chunks: int):
-    print("\n" + "=" * 60)
-    print("LTX-2.3 DIRECTOR 2.0 MV")
-    print("Google Colab T4 Engine")
-    print("=" * 60)
+def print_banner(total_frames, fps, duration_s, width, height, chunk_size, n_chunks):
+    print("\n" + "=" * 62)
+    print("  LTX-2.3 DIRECTOR 2.0 MV  —  Google Colab T4 Engine  v2.0")
+    print("=" * 62)
     print(f"  GPU          : {_GPU_INFO['device_name']}")
-    print(f"  VRAM         : {_GPU_INFO['vram_total_gb']:.1f} GB total  "
-          f"/ {mem.gpu_free_gb():.1f} GB free")
+    print(f"  VRAM         : {_GPU_INFO['vram_total_gb']:.1f} GB total")
+    print_vram_usage("  ")
     print(f"  Resolution   : {width}×{height}")
     print(f"  FPS          : {fps}")
-    print(f"  Duration     : {duration_s:.2f}s")
-    print(f"  Frames       : {total_frames}")
-    print(f"  Chunk size   : {chunk_size} frames")
-    print(f"  Est. chunks  : {n_chunks}")
+    print(f"  Duration     : {duration_s:.2f}s  ({total_frames} frames)")
+    print(f"  Chunk size   : {chunk_size} frames  ({n_chunks} chunks est.)")
     print(f"  Quality mode : {CONFIG['quality_mode']}")
+    print(f"  Sigma mode   : {CONFIG['sigma_preset_mode']}")
+    print(f"  ModelCache   : {'ON' if CONFIG['use_model_cache'] else 'OFF'}")
+    print(f"  FaceRestore  : {'ON' if CONFIG.get('face_restoration') else 'OFF'}")
     print(f"  Resume       : {CONFIG['resume']}")
-    print("=" * 60)
+    print("=" * 62)
 
 
 def generate_director_mv(
@@ -3576,249 +2767,196 @@ def generate_director_mv(
     height: int = None,
     seed: int = None,
     quality_mode: str = None,
-):
+) -> Optional[str]:
     """
     Complete LTX-2.3 Director 2.0 MV generation pipeline.
 
-    Parameters
-    ----------
-    image_path      : Path to a reference image (or None for T2V).
-    audio_path      : Path to audio file for sync mux (or None).
-    prompt          : Generation prompt (defaults to embedded workflow prompt).
-    duration_seconds: Video length in seconds (default: CONFIG value = 31.5).
-    fps             : Frame rate (default: 24).
-    width / height  : Output resolution (default: 1280×720).
-    seed            : Global random seed.
-    quality_mode    : "t4_safe" | "t4_balanced" | "t4_aggressive".
-
-    Returns
-    -------
-    str : Path to the final output video, or None on failure.
+    New in v2.0:
+      [MEM-3] auto_adjust_settings() applied at startup
+      [MEM-7] cleanup_old_cache() run before generation
+      [MEM-2] ModelCache evicted after generation loop
+      [MEM-5] aggressive_cleanup after conditioning release
     """
-    # ── Resolve parameters from CONFIG if not passed ──────────────────────────
-    duration_s    = duration_seconds if duration_seconds is not None else CONFIG["duration_seconds"]
-    fps           = fps    or CONFIG["fps"]
-    width         = width  or CONFIG["width"]
-    height        = height or CONFIG["height"]
-    seed          = seed   if seed is not None else CONFIG["seed"]
-    quality_mode  = quality_mode or CONFIG["quality_mode"]
+    duration_s   = duration_seconds if duration_seconds is not None else CONFIG["duration_seconds"]
+    fps          = fps    or CONFIG["fps"]
+    width        = width  or CONFIG["width"]
+    height       = height or CONFIG["height"]
+    seed         = seed   if seed is not None else CONFIG["seed"]
+    quality_mode = quality_mode or CONFIG["quality_mode"]
+
+    # [MEM-3] Auto-adjust quality based on detected VRAM
+    overrides = auto_adjust_settings()
+    if overrides.get("quality_mode"):
+        quality_mode = overrides["quality_mode"]
+        CONFIG["quality_mode"] = quality_mode
+    if "use_model_cache" in overrides:
+        CONFIG["use_model_cache"] = overrides["use_model_cache"]
 
     generation_start = time.time()
 
-    # ── Profile & resolution check ────────────────────────────────────────────
+    # [MEM-7] Clean stale workspace cache files before starting
+    cache_dir = os.path.join(CONFIG["workspace_dir"], "cache")
+    cleanup_old_cache(cache_dir, max_age_days=CONFIG.get("cache_max_age_days", 7))
+
     profile = select_profile(quality_mode)
     width, height = check_resolution_safety(width, height, quality_mode)
 
-    # ── Preview mode shortcut ─────────────────────────────────────────────────
     if CONFIG["preview_mode"]:
-        return generate_preview(
-            image_path=image_path,
-            prompt=prompt,
-            fps=fps,
-            width=width,
-            height=height,
-            seed=seed,
-            profile=profile,
-            preview_duration=CONFIG.get("preview_duration", 3.0),
-        )
+        return generate_preview(image_path=image_path, prompt=prompt,
+                                 fps=fps, width=width, height=height,
+                                 seed=seed, profile=profile,
+                                 preview_duration=CONFIG.get("preview_duration", 3.0))
 
-    # ── Timeline calculation ──────────────────────────────────────────────────
     total_frames, actual_duration = calculate_timeline(duration_s, fps)
-
-    # ── Chunk planning ────────────────────────────────────────────────────────
     chunk_size = estimate_chunk_size(width, height, fps, quality_mode)
     all_chunks = plan_chunks(total_frames, chunk_size, fps)
 
     print_banner(total_frames, fps, actual_duration, width, height, chunk_size, len(all_chunks))
-
-    # ── Validation ────────────────────────────────────────────────────────────
     run_all_validations(image_path, audio_path, width, height, total_frames)
 
-    # ── ComfyUI initialisation ────────────────────────────────────────────────
     setup_comfyui()
     import_custom_nodes()
 
-    # ── Checkpoint ────────────────────────────────────────────────────────────
     checkpoint = get_or_create_checkpoint(fps, total_frames, seed, width, height)
 
-    # ── Load input image once (keep on CPU) ───────────────────────────────────
     loaded_image, img_strength, img_bypass = load_input_image(image_path, width, height)
 
-    # ── Build text conditioning once and cache on CPU ─────────────────────────
     print("\n  Building text conditioning...")
     mem.cleanup()
     pos_cond, neg_cond = build_text_conditioning(prompt, fps)
 
-    # ── Main generation loop ──────────────────────────────────────────────────
     print(f"\n  Starting generation: {len(all_chunks)} chunks...")
     torch.cuda.reset_peak_memory_stats()
 
     completed_chunks = adaptive_chunk_generator(
-        chunks=all_chunks,
-        pos_cond=pos_cond,
-        neg_cond=neg_cond,
+        chunks=all_chunks, pos_cond=pos_cond, neg_cond=neg_cond,
         loaded_image_tuple=loaded_image,
-        image_strength=img_strength,
-        image_bypass=img_bypass,
-        width=width,
-        height=height,
-        fps=fps,
-        profile=profile,
-        global_seed=seed,
-        checkpoint=checkpoint,
+        image_strength=img_strength, image_bypass=img_bypass,
+        width=width, height=height, fps=fps,
+        profile=profile, global_seed=seed, checkpoint=checkpoint,
     )
 
-    # Release conditioning and image — no longer needed
+    # [MEM-5] Full cleanup after generation loop
     del pos_cond, neg_cond, loaded_image
     _CONDITIONING_CACHE.clear()
+    LORA_REGISTRY.clear()
+    if MODEL_CACHE is not None:
+        MODEL_CACHE.evict_all()                                # [MEM-2] evict after all chunks
     mem.aggressive_cleanup()
 
     if not completed_chunks:
-        print("\n  ✗ No chunks were completed. Generation aborted.")
+        print("\n  ✗ No chunks completed. Generation aborted.")
         return None
 
-    # ── Assemble chunks → intermediate video ─────────────────────────────────
     Path(CONFIG["output_dir"]).mkdir(parents=True, exist_ok=True)
     assembled_path = os.path.join(CONFIG["output_dir"], "_assembled_no_audio.mp4")
-    assembly_ok = assemble_chunks_to_video(completed_chunks, assembled_path, fps)
-    if not assembly_ok:
+    if not assemble_chunks_to_video(completed_chunks, assembled_path, fps):
         print("\n  ✗ Video assembly failed.")
         return None
 
-    # ── Mux audio ─────────────────────────────────────────────────────────────
     final_output = os.path.join(CONFIG["output_dir"], CONFIG["output_filename"])
-    audio_start_s = 0.0  # Can be set to workflow value (446.92/24 ≈ 18.6s) if needed
-    assemble_video_with_audio(
-        video_path=assembled_path,
-        audio_path=audio_path,
-        output_path=final_output,
-        fps=fps,
-        total_frames=total_frames,
-        audio_start_seconds=audio_start_s,
-    )
+    assemble_video_with_audio(video_path=assembled_path, audio_path=audio_path,
+                               output_path=final_output, fps=fps,
+                               total_frames=total_frames, audio_start_seconds=0.0)
 
-    # Remove intermediate no-audio file
     if os.path.exists(assembled_path) and assembled_path != final_output:
         os.remove(assembled_path)
 
-    # ── Final validation ──────────────────────────────────────────────────────
     validate_output_video(final_output, total_frames, fps)
 
-    # ── Job report ────────────────────────────────────────────────────────────
-    write_job_report(
-        output_path=final_output,
-        total_frames=total_frames,
-        fps=fps,
-        width=width,
-        height=height,
-        chunk_size=chunk_size,
-        completed_chunks=completed_chunks,
-        failed_chunks=checkpoint.get("failed_chunks", []),
-        generation_start_time=generation_start,
-        seed=seed,
-    )
+    write_job_report(output_path=final_output, total_frames=total_frames,
+                     fps=fps, width=width, height=height, chunk_size=chunk_size,
+                     completed_chunks=completed_chunks,
+                     failed_chunks=checkpoint.get("failed_chunks", []),
+                     generation_start_time=generation_start, seed=seed)
 
-    # ── Cleanup temp files ────────────────────────────────────────────────────
     cleanup_temp_files(completed_chunks, keep_chunks=CONFIG["keep_temp_chunks"])
 
-    # ── Final memory report ───────────────────────────────────────────────────
     mem.aggressive_cleanup()
     final_memory_report()
 
-    print(f"\n{'='*60}")
+    print(f"\n{'='*62}")
     print(f"✓ GENERATION COMPLETE")
     print(f"  Output: {final_output}")
-    print(f"{'='*60}\n")
-
+    print(f"{'='*62}\n")
     return final_output
 
 
 # =============================================================================
 # SECTION 29 — COLAB CELL RUNNER
 # =============================================================================
-# Copy-paste the individual cells below into a Colab notebook.
-# Each cell is self-contained and idempotent.
-#
 # ─────────────────────────────────────────────────────────────────────────────
 # CELL 1 — Install environment (run once per runtime)
 # ─────────────────────────────────────────────────────────────────────────────
 # install_environment()
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# CELL 2 — Download models (run once per runtime or after /content is cleared)
+# CELL 2 — Download models (run once per runtime)
 # ─────────────────────────────────────────────────────────────────────────────
 # download_all_models()
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# CELL 3 — (Optional) Upload reference images and audio
+# CELL 3 — Upload reference image and audio
 # ─────────────────────────────────────────────────────────────────────────────
 # from google.colab import files
 # import shutil, os
-# os.makedirs('/content/ComfyUI/input/whatdreamscost', exist_ok=True)
+# os.makedirs('/content/ComfyUI/input', exist_ok=True)
 # uploaded = files.upload()
 # for fname in uploaded:
-#     dest = f"/content/ComfyUI/input/whatdreamscost/{fname}"
-#     shutil.move(f"/content/ComfyUI/{fname}", dest)
-#     print(f"Saved: {dest}")
+#     shutil.move(f'/content/ComfyUI/{fname}', f'/content/ComfyUI/input/{fname}')
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # CELL 4 — Configure and generate
 # ─────────────────────────────────────────────────────────────────────────────
-# All settings are now controlled by the @param form widgets at the TOP of
-# SECTION 1. Simply adjust them in the form UI, then run this cell.
-#
-# Example: override individual settings programmatically if needed:
-#   CONFIG["quality_mode"] = "t4_balanced"
-#   SEED = 999
+# Adjust @param widgets in SECTION 1, then run:
 #
 # output = generate_director_mv(
-#     image_path=IMAGE_PATH,
-#     audio_path=AUDIO_PATH,
-#     prompt=GLOBAL_PROMPT,
+#     image_path = IMAGE_PATH,
+#     audio_path = AUDIO_PATH,
+#     prompt     = GLOBAL_PROMPT,
 # )
-#
 # if output:
 #     from google.colab import files
 #     files.download(output)
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# CELL 5 — Download output (if not done in Cell 4)
+# CELL 5 — Memory diagnostic (run anytime to check VRAM / RAM)
 # ─────────────────────────────────────────────────────────────────────────────
-# from google.colab import files
-# files.download('/content/ltx23_output/LTX23_Director_30s.mp4')
+# mem.print_memory()
+# print_vram_usage()
+# print(auto_adjust_settings())
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 6 — Force-evict model cache (run if you hit OOM between sessions)
+# ─────────────────────────────────────────────────────────────────────────────
+# if MODEL_CACHE: MODEL_CACHE.evict_all()
+# release_dit_model()
+# mem.aggressive_cleanup()
+# print_vram_usage()
 
 # =============================================================================
 # SECTION 30 — DIRECT EXECUTION GUARD
 # =============================================================================
-# This block runs automatically if the script is executed directly
-# (i.e., not imported as a module in a notebook).
 
 if __name__ == "__main__":
-    print("\nRunning LTX23_Director_2_0_MV_Colab_T4.py directly...")
-    print("This script is designed for Google Colab. Running setup steps...\n")
+    print("\nRunning LTX23_Director_2_0_MV_Colab_T4_FIXED.py directly...")
+    print("Designed for Google Colab. Running setup steps...\n")
 
-    # Step 1: Install
     install_environment()
-
-    # Step 2: Download models
     download_all_models()
-
-    # Step 3: ComfyUI + nodes
     setup_comfyui()
     import_custom_nodes()
 
-    # Step 4: Generate
-    # Adjust image_path and audio_path as needed.
     output = generate_director_mv(
-        image_path=IMAGE_PATH,          # set via @param above
-        audio_path=AUDIO_PATH,          # set via @param above
-        prompt=GLOBAL_PROMPT,
-        duration_seconds=CONFIG["duration_seconds"],
-        fps=CONFIG["fps"],
-        width=CONFIG["width"],
-        height=CONFIG["height"],
-        seed=CONFIG["seed"],
-        quality_mode=CONFIG["quality_mode"],
+        image_path       = IMAGE_PATH,
+        audio_path       = AUDIO_PATH,
+        prompt           = GLOBAL_PROMPT,
+        duration_seconds = CONFIG["duration_seconds"],
+        fps              = CONFIG["fps"],
+        width            = CONFIG["width"],
+        height           = CONFIG["height"],
+        seed             = CONFIG["seed"],
+        quality_mode     = CONFIG["quality_mode"],
     )
 
     if output:
