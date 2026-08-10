@@ -149,6 +149,12 @@ CLEANUP_AFTER_CHUNK   = True   # @param {type:"boolean", label:"Run aggressive C
 CLEANUP_AFTER_STAGE   = True   # @param {type:"boolean", label:"Run CUDA cleanup after each pipeline stage"}
 KEEP_TEMP_CHUNKS      = False  # @param {type:"boolean", label:"Keep temporary chunk files after assembly"}
 CLEANUP_TEMP_FILES    = True   # @param {type:"boolean", label:"Delete temp files after final assembly"}
+# @markdown > `INTER_CHUNK_SLEEP_MS`: brief pause between chunks so the OS can
+# @markdown > reclaim CPU/GPU memory pages before the next chunk starts. 0 = disabled.
+INTER_CHUNK_SLEEP_MS  = 500   # @param {type:"integer", min:0, max:5000, label:"Sleep between chunks (ms) — lets OS reclaim memory"}
+# @markdown > `FRAG_DEFRAG_THRESHOLD`: auto-trigger aggressive cleanup when the
+# @markdown > fraction of reserved-but-unallocated VRAM exceeds this value.
+FRAG_DEFRAG_THRESHOLD = 0.30  # @param {type:"slider", min:0.05, max:0.9, step:0.05, label:"Fragmentation threshold for auto-defrag"}
 
 # ── ⑬ Paths ───────────────────────────────────────────────────────────────────
 # @markdown ---
@@ -241,6 +247,8 @@ CONFIG = {
     "cleanup_after_stage":  CLEANUP_AFTER_STAGE,
     "keep_temp_chunks":     KEEP_TEMP_CHUNKS,
     "cleanup_temp_files":   CLEANUP_TEMP_FILES,
+    "inter_chunk_sleep_ms": INTER_CHUNK_SLEEP_MS,
+    "frag_defrag_threshold": FRAG_DEFRAG_THRESHOLD,
 
     # ── Preview
     "preview_mode":      PREVIEW_MODE,
@@ -520,9 +528,10 @@ class LTXMemoryManager:
     # ── Cleanup tiers ─────────────────────────────────────────────────────────
 
     def soft_cleanup(self):
-        """Quick GC + cache flush — minimal overhead."""
+        """Quick GC + cache flush — minimal overhead. Includes ipc_collect."""
         gc.collect()
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()   # cheap; frees IPC-shared tensors from ComfyUI workers
 
     def cleanup(self):
         """Standard post-operation cleanup."""
@@ -531,17 +540,50 @@ class LTXMemoryManager:
         torch.cuda.ipc_collect()
 
     def aggressive_cleanup(self):
-        """Full cleanup: GC cycles, cache, IPC, peak reset."""
-        for _ in range(3):
-            gc.collect()
-        torch.cuda.synchronize()
+        """
+        Full cleanup: synchronize GPU first, then GC, then cache/IPC flush.
+        FIX 1 — synchronize() BEFORE gc.collect() so CUDA ops finish before
+        Python GC can free wrapper objects whose CUDA buffers are still live.
+        """
+        torch.cuda.synchronize()        # ← flush GPU FIRST
+        gc.collect()                    # ← safe to GC now
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+        gc.collect()                    # second pass catches new garbage
+        torch.cuda.empty_cache()        # second flush after second GC
         torch.cuda.reset_peak_memory_stats()
-        gc.collect()
 
     def empty_cuda_cache(self):
         torch.cuda.empty_cache()
+
+    # ── Fragmentation helpers ─────────────────────────────────────────────────
+
+    def fragment_score(self) -> float:
+        """
+        FIX 8 — Ratio of reserved-but-unallocated VRAM.
+        A high score (> 0.30) means heavy fragmentation from small allocations;
+        aggressive_cleanup will compact the allocator state.
+        """
+        allocated = torch.cuda.memory_allocated()
+        reserved  = torch.cuda.memory_reserved()
+        if reserved == 0:
+            return 0.0
+        return (reserved - allocated) / reserved
+
+    def defrag_if_needed(self, threshold: float = None) -> bool:
+        """
+        FIX 8 — Run aggressive_cleanup if fragmentation exceeds threshold.
+        Returns True if a defrag was triggered.
+        """
+        threshold = threshold or CONFIG.get("frag_defrag_threshold", 0.30)
+        score = self.fragment_score()
+        if score > threshold:
+            print(f"  ⚠ Fragmentation {score:.1%} > {threshold:.0%} — defragmenting...")
+            self.aggressive_cleanup()
+            print(f"  ↑ After defrag: {self.gpu_free_gb():.2f} GB free  "
+                  f"(frag now {self.fragment_score():.1%})")
+            return True
+        return False
 
     # ── Object release ────────────────────────────────────────────────────────
 
@@ -576,13 +618,14 @@ class LTXMemoryManager:
     def memory_report(self, prefix: str = "") -> str:
         lines = [
             f"{prefix}GPU Memory:",
-            f"{prefix}  Allocated : {self.gpu_allocated_gb():.3f} GB",
-            f"{prefix}  Reserved  : {self.gpu_reserved_gb():.3f} GB",
-            f"{prefix}  Free      : {self.gpu_free_gb():.3f} GB",
-            f"{prefix}  Peak      : {self.gpu_peak_gb():.3f} GB",
+            f"{prefix}  Allocated  : {self.gpu_allocated_gb():.3f} GB",
+            f"{prefix}  Reserved   : {self.gpu_reserved_gb():.3f} GB",
+            f"{prefix}  Free       : {self.gpu_free_gb():.3f} GB",
+            f"{prefix}  Peak       : {self.gpu_peak_gb():.3f} GB",
+            f"{prefix}  Frag score : {self.fragment_score():.1%}",
             f"{prefix}CPU RAM:",
-            f"{prefix}  Used      : {self.cpu_used_gb():.3f} GB",
-            f"{prefix}  Available : {self.cpu_available_gb():.3f} GB",
+            f"{prefix}  Used       : {self.cpu_used_gb():.3f} GB",
+            f"{prefix}  Available  : {self.cpu_available_gb():.3f} GB",
         ]
         if self._chunk_info:
             lines += [
@@ -600,16 +643,104 @@ class LTXMemoryManager:
         self._chunk_info = {"index": index, "frames": frames, "resolution": f"{w}×{h}"}
 
     def warn_if_low(self):
+        """FIX 15 — includes fragmentation score alongside memory threshold warning."""
         free = self.gpu_free_gb()
+        frag = self.fragment_score()
         if free < self.safety_margin_gb:
-            print(f"  WARNING: GPU memory below safety threshold ({free:.2f} GB < {self.safety_margin_gb:.2f} GB). Starting cleanup.")
+            print(f"  ⚠ GPU memory low: {free:.2f} GB free | frag: {frag:.1%}")
             self.aggressive_cleanup()
+            print(f"  ↑ After cleanup: {self.gpu_free_gb():.2f} GB free  "
+                  f"(frag now {self.fragment_score():.1%})")
 
 # Singleton instance used throughout
 mem = LTXMemoryManager(
     safety_margin_gb=CONFIG["gpu_safety_margin_gb"],
     enable_logging=CONFIG["enable_memory_logging"],
 )
+
+
+# =============================================================================
+# FIX 14 — memory_checkpoint() context manager
+# =============================================================================
+
+from contextlib import contextmanager
+
+@contextmanager
+def memory_checkpoint(label: str = ""):
+    """
+    Context manager that logs GPU memory before/after a block and runs
+    soft_cleanup on exit. Useful for wrapping individual pipeline stages.
+
+    Usage:
+        with memory_checkpoint("pass1_sampling"):
+            sample_out_1 = run_sampling_pass(...)
+    """
+    before = mem.gpu_free_gb()
+    try:
+        yield
+    finally:
+        mem.soft_cleanup()
+        if CONFIG["enable_memory_logging"]:
+            after = mem.gpu_free_gb()
+            delta = after - before
+            sign = "+" if delta >= 0 else ""
+            frag = mem.fragment_score()
+            print(f"  [mem:{label}] {before:.2f}→{after:.2f} GB "
+                  f"({sign}{delta:.2f} GB | frag {frag:.1%})")
+
+
+# =============================================================================
+# FIX 13 — VAE singleton cache (load once, keep on CPU between chunks)
+# =============================================================================
+
+_VAE_CACHE: Dict[str, Any] = {"video": None, "audio": None}
+
+
+def get_cached_video_vae():
+    """Return (or load) the video VAE from the singleton cache."""
+    if _VAE_CACHE["video"] is None:
+        _VAE_CACHE["video"] = _load_video_vae_raw()
+        print(f"  ✓ Video VAE cached.  GPU free: {mem.gpu_free_gb():.2f} GB")
+    return _VAE_CACHE["video"]
+
+
+def get_cached_audio_vae():
+    """Return (or load) the audio VAE from the singleton cache."""
+    if _VAE_CACHE["audio"] is None:
+        _VAE_CACHE["audio"] = _load_audio_vae_raw()
+        print(f"  ✓ Audio VAE cached.  GPU free: {mem.gpu_free_gb():.2f} GB")
+    return _VAE_CACHE["audio"]
+
+
+def offload_vaes_to_cpu():
+    """Move both cached VAEs to CPU to free VRAM between sampling passes."""
+    for key in ("video", "audio"):
+        vae = _VAE_CACHE.get(key)
+        if vae is not None and hasattr(vae, "to"):
+            try:
+                vae.to("cpu")
+            except Exception:
+                pass
+
+
+def reload_vaes_to_gpu():
+    """Move both cached VAEs back to GPU for decode."""
+    for key in ("video", "audio"):
+        vae = _VAE_CACHE.get(key)
+        if vae is not None and hasattr(vae, "to"):
+            try:
+                vae.to(DEVICE)
+            except Exception:
+                pass
+
+
+def release_vaes():
+    """Unload both VAEs from the singleton cache and free VRAM."""
+    for key in ("video", "audio"):
+        if _VAE_CACHE[key] is not None:
+            mem.release_model(_VAE_CACHE[key], f"{key} VAE")
+            _VAE_CACHE[key] = None
+    print(f"  ✓ VAEs released.  GPU free: {mem.gpu_free_gb():.2f} GB")
 
 
 # =============================================================================
@@ -1653,7 +1784,17 @@ def get_audio_segment_for_chunk(
 # =============================================================================
 
 # CPU-resident conditioning cache: avoids re-encoding identical prompts
+# FIX 17 — bounded to _CONDITIONING_CACHE_MAX entries so it can't grow unbounded
+# when many different per-segment prompts are encoded over a long job.
 _CONDITIONING_CACHE: Dict[str, Any] = {}
+_CONDITIONING_CACHE_MAX = 8
+
+def _cache_set_conditioning(key: str, value: Any):
+    """Insert into _CONDITIONING_CACHE, evicting the oldest entry if full."""
+    if len(_CONDITIONING_CACHE) >= _CONDITIONING_CACHE_MAX:
+        oldest = next(iter(_CONDITIONING_CACHE))
+        del _CONDITIONING_CACHE[oldest]
+    _CONDITIONING_CACHE[key] = value
 
 
 def build_text_conditioning(
@@ -1725,7 +1866,7 @@ def build_text_conditioning(
     neg_cond = get_value_at_index(cond, 1)
 
     result = (pos_cond, neg_cond)
-    _CONDITIONING_CACHE[ck] = result
+    _cache_set_conditioning(ck, result)
     print("  ✓ Text conditioning built and cached.")
 
     del pos_encoded, neg_encoded, cond
@@ -1819,6 +1960,11 @@ def load_dit_model(apply_loras: bool = True, force_reload: bool = False) -> Any:
                 print(f"  ⚠ LoRA not found, skipping: {fname}")
 
     _DIT_MODEL_CACHE[0] = model
+    # FIX 10 — synchronize after LoRA patching so all CUDA ops are settled
+    # before we report free memory or let the caller begin sampling
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
     print(f"  ✓ DiT model ready.  GPU free after load: {mem.gpu_free_gb():.2f} GB")
     return model
 
@@ -1836,8 +1982,8 @@ def release_dit_model():
         print(f"  ✓ DiT released.  GPU free: {mem.gpu_free_gb():.2f} GB")
 
 
-def load_video_vae() -> Any:
-    """Load video VAE (workflow node 36 — VAELoader)."""
+def _load_video_vae_raw() -> Any:
+    """Internal: load video VAE directly from disk (uncached)."""
     print("  Loading video VAE...")
     vaeloader = get_node("VAELoader")
     result = vaeloader.load_vae(vae_name=MODELS["video_vae"])
@@ -1846,11 +1992,13 @@ def load_video_vae() -> Any:
     return vae
 
 
-def load_audio_vae() -> Any:
-    """
-    Load audio VAE with version-resilient fallback
-    (workflow node 8 — VAELoader / VAELoaderKJ).
-    """
+def load_video_vae() -> Any:
+    """FIX 13 — Load video VAE via singleton cache (avoid reload each chunk)."""
+    return get_cached_video_vae()
+
+
+def _load_audio_vae_raw() -> Any:
+    """Internal: load audio VAE directly from disk (uncached)."""
     print("  Loading audio VAE...")
     from nodes import NODE_CLASS_MAPPINGS
 
@@ -1870,6 +2018,11 @@ def load_audio_vae() -> Any:
     vae = get_value_at_index(result, 0)
     del result
     return vae
+
+
+def load_audio_vae() -> Any:
+    """FIX 13 — Load audio VAE via singleton cache (avoid reload each chunk)."""
+    return get_cached_audio_vae()
 
 
 def load_tiny_vae() -> Any:
@@ -2176,8 +2329,11 @@ def build_empty_latents(
         )
 
     del empty_video_lat, empty_audio_lat
+    # FIX 3 — img_conditioned_lat already consumed into av_latent above; delete it
+    # so the caller only receives the one object it actually needs.
+    del img_conditioned_lat
     mem.soft_cleanup()
-    return av_latent, img_conditioned_lat
+    return av_latent
 
 
 def run_sampling_pass(
@@ -2237,7 +2393,9 @@ def run_sampling_pass(
     )
 
     del noise, sampler, sigmas, guider
-    mem.soft_cleanup()
+    # FIX 2 — delete ComfyUI node instances; they hold internal state/buffers
+    del ksamplerselect, randomnoise, basicscheduler, cfgguider, samplercustomadvanced
+    mem.cleanup()   # upgrade from soft_cleanup: adds ipc_collect for any ComfyUI IPC tensors
     return result
 
 
@@ -2292,6 +2450,7 @@ def recondition_image_on_upscaled(
             latent=upscaled_latent,
         )
         video_lat_for_pass2 = get_value_at_index(reconditioned, 0)
+        del reconditioned   # FIX 4 — free wrapper tuple immediately
     else:
         video_lat_for_pass2 = upscaled_latent
 
@@ -2319,9 +2478,11 @@ def decode_video_latent(video_latent, video_vae) -> Any:
     decoded = vaedecode.decode(samples=video_latent, vae=video_vae)
     frames_gpu = get_value_at_index(decoded, 0)
 
-    # Transfer to CPU immediately, non-blocking where safe
-    frames_cpu = frames_gpu.detach().to("cpu", non_blocking=False)
-    torch.cuda.synchronize()
+    # FIX 5 — use non_blocking=True then explicit synchronize for maximum overlap.
+    # The transfer starts on a CUDA stream while Python continues; synchronize()
+    # then blocks until the transfer is complete before we del the GPU tensor.
+    frames_cpu = frames_gpu.detach().to("cpu", non_blocking=True)
+    torch.cuda.synchronize()   # ensures DMA transfer is done before del
 
     del frames_gpu, decoded
     mem.cleanup()
@@ -2421,16 +2582,18 @@ def save_chunk_to_disk(
 
 def _write_chunk_via_ffmpeg(frames_cpu, audio_cpu, out_path: str, fps: int, w: int, h: int):
     """
-    Pipe raw RGB frames directly into ffmpeg. Avoids holding a decoded frame
-    list in RAM by streaming one frame at a time.
+    Pipe raw RGB frames directly into ffmpeg.
+    FIX 6 — convert and stream one frame at a time instead of creating
+    a full uint8 numpy copy of the entire tensor upfront.
+    Before this fix: float32 tensor (~90 MB) + full uint8 array (~22 MB) = ~112 MB peak.
+    After this fix: float32 tensor + one frame uint8 (~22 KB) = float32 only.
     """
-    # Ensure frames are uint8 numpy
     if torch.is_tensor(frames_cpu):
-        frames_np = (frames_cpu.clamp(0, 1) * 255).byte().numpy()  # (N, H, W, 3)
+        n_frames = frames_cpu.shape[0]
+        fh       = frames_cpu.shape[1]
+        fw       = frames_cpu.shape[2]
     else:
-        frames_np = frames_cpu
-
-    n_frames, fh, fw, _ = frames_np.shape
+        n_frames, fh, fw, _ = frames_cpu.shape
 
     cmd = [
         "ffmpeg", "-y",
@@ -2447,13 +2610,20 @@ def _write_chunk_via_ffmpeg(frames_cpu, audio_cpu, out_path: str, fps: int, w: i
         out_path,
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    for i in range(n_frames):
-        proc.stdin.write(frames_np[i].tobytes())
-        # Release each frame after writing to avoid doubling RAM
-        if i % 16 == 0:
-            gc.collect()
-    proc.stdin.close()
-    proc.wait()
+    try:
+        for i in range(n_frames):
+            # FIX 6 — convert one frame at a time to keep RAM peak tiny
+            if torch.is_tensor(frames_cpu):
+                frame_np = (frames_cpu[i].clamp(0, 1) * 255).byte().numpy()
+            else:
+                frame_np = frames_cpu[i]
+            proc.stdin.write(frame_np.tobytes())
+            del frame_np
+            if i % 8 == 0:
+                gc.collect()
+    finally:
+        proc.stdin.close()
+        proc.wait()
     print(f"  ✓ Chunk saved (ffmpeg pipe): {out_path}")
 
 
@@ -2528,7 +2698,12 @@ def generate_chunk(
 
     mem.set_chunk_info(idx, num_frames, width, height)
     if CONFIG["enable_memory_logging"]:
-        print(f"\n  GPU before chunk {idx}: {mem.gpu_free_gb():.2f} GB free")
+        print(f"\n  GPU before chunk {idx}: {mem.gpu_free_gb():.2f} GB free  "
+              f"(frag {mem.fragment_score():.1%})")
+
+    # FIX 13+defrag — proactive defrag before starting the chunk so fragmentation
+    # from the previous chunk doesn't carry into this one's allocations
+    mem.defrag_if_needed(CONFIG.get("frag_defrag_threshold", 0.30))
 
     # FIX 4: Use provided model; fall back to singleton cache if caller omits it
     if dit_model is None:
@@ -2540,44 +2715,45 @@ def generate_chunk(
             loaded_image_tuple, width, height, img_compress, longer_edge
         )
 
-        # ── 2. Load video VAE (audio VAE loaded once for audio latent creation)
+        # ── 2. Load video VAE + audio VAE (FIX 13 — via singleton cache)
         video_vae = load_video_vae()
         audio_vae = load_audio_vae()
 
-        # ── 3. Load upscaler ──────────────────────────────────────────────────
-        upscaler = load_upscaler_model()
-
-        # ── 4. Build empty latents ────────────────────────────────────────────
-        av_latent_pass1, img_conditioned_lat = build_empty_latents(
+        # ── 3. Build empty latents (upscaler loaded LATER — Fix 11+12) ────────
+        av_latent_pass1 = build_empty_latents(     # FIX 3 — single return value
             num_frames, latent_w, latent_h, fps,
             preprocessed, image_strength, image_bypass,
             video_vae, audio_vae,
         )
 
         # ── 5. LTXDirectorGuide pass 1 (workflow node 133: upscale_factor=0.5)
-        pos_g1, neg_g1, lat_g1, model_g1 = run_director_guide(
-            pos_cond=pos_cond,
-            neg_cond=neg_cond,
-            video_vae=video_vae,
-            latent=get_value_at_index(av_latent_pass1, 0),
-            guide_data=None,
-            motion_guide_data=None,
-            model=dit_model,
-            upscale_factor=0.5,
-            node_id="pass1",
-        )
+        with memory_checkpoint("guide_pass1"):
+            pos_g1, neg_g1, lat_g1, model_g1 = run_director_guide(
+                pos_cond=pos_cond,
+                neg_cond=neg_cond,
+                video_vae=video_vae,
+                latent=get_value_at_index(av_latent_pass1, 0),
+                guide_data=None,
+                motion_guide_data=None,
+                model=dit_model,
+                upscale_factor=0.5,
+                node_id="pass1",
+            )
+        # FIX 9 — explicit cleanup after director guide (node holds internal buffers)
+        mem.cleanup()
 
         # ── 6. Sampling pass 1 ────────────────────────────────────────────────
-        sample_out_1 = run_sampling_pass(
-            model=model_g1,
-            pos_cond=pos_g1,
-            neg_cond=neg_g1,
-            latent=lat_g1,
-            noise_seed=chunk_seed,
-            steps=WORKFLOW_STEPS,
-            cfg=WORKFLOW_CFG,
-            pass_name=f"Pass1 (chunk {idx})",
-        )
+        with memory_checkpoint("sample_pass1"):
+            sample_out_1 = run_sampling_pass(
+                model=model_g1,
+                pos_cond=pos_g1,
+                neg_cond=neg_g1,
+                latent=lat_g1,
+                noise_seed=chunk_seed,
+                steps=WORKFLOW_STEPS,
+                cfg=WORKFLOW_CFG,
+                pass_name=f"Pass1 (chunk {idx})",
+            )
 
         del pos_g1, neg_g1, lat_g1, av_latent_pass1
         mem.cleanup()
@@ -2595,27 +2771,21 @@ def generate_chunk(
         del video_lat_p1
         mem.soft_cleanup()
 
-        # ── FIX 5: Offload VAE + upscaler to CPU before 2× upsample ──────────
+        # ── FIX 5+13: Offload cached VAEs to CPU before 2× upsample ──────────
         # After Pass 1, video_vae and audio_vae together hold ~2-3 GB.
-        # Offloading them here gives Pass 2 the headroom it needs.
-        if hasattr(video_vae, "to"):
-            try:
-                video_vae.to("cpu")
-            except Exception:
-                pass
-        if hasattr(audio_vae, "to"):
-            try:
-                audio_vae.to("cpu")
-            except Exception:
-                pass
-        # Upscaler is only needed for the upsample step; delete after
-        # (upscale runs below, then we immediately del upscaler)
+        # Using the cache's offload helper ensures both are moved atomically.
+        offload_vaes_to_cpu()
         mem.empty_cuda_cache()
         gc.collect()
-        print(f"  VAEs offloaded.  GPU free: {mem.gpu_free_gb():.2f} GB")
+        print(f"  VAEs offloaded.  GPU free: {mem.gpu_free_gb():.2f} GB  "
+              f"(frag {mem.fragment_score():.1%})")
+
+        # ── FIX 11+12: Load upscaler HERE (just before it's needed) ──────────
+        # Previously loaded at chunk start, sitting in VRAM ~200 MB for all of Pass 1.
+        upscaler = load_upscaler_model()
 
         # ── 9. 2× latent spatial upscale (workflow node 14) ───────────────────
-        # Bring video_vae back briefly for the upscaler (needs it for decode)
+        # Bring video_vae back to GPU briefly for the upscaler
         if hasattr(video_vae, "to"):
             try:
                 video_vae.to(DEVICE)
@@ -2630,7 +2800,6 @@ def generate_chunk(
             except Exception:
                 pass
         mem.cleanup()
-
         # ── 10. Re-condition image on upscaled latent + concat audio ──────────
         # Use CPU video_vae here (LTXVImgToVideoInplace works on CPU VAE)
         av_latent_pass2 = recondition_image_on_upscaled(
@@ -2641,33 +2810,39 @@ def generate_chunk(
         mem.soft_cleanup()
 
         # ── 11. LTXDirectorGuide pass 2 (workflow node 132: upscale_factor=1) ─
-        pos_g2, neg_g2, lat_g2, model_g2 = run_director_guide(
-            pos_cond=pos_cropped,
-            neg_cond=neg_cropped,
-            video_vae=video_vae,
-            latent=get_value_at_index(av_latent_pass2, 0),
-            guide_data=None,
-            motion_guide_data=None,
-            model=model_g1 if model_g1 is not dit_model else dit_model,
-            upscale_factor=1.0,
-            node_id="pass2",
-        )
+        with memory_checkpoint("guide_pass2"):
+            pos_g2, neg_g2, lat_g2, model_g2 = run_director_guide(
+                pos_cond=pos_cropped,
+                neg_cond=neg_cropped,
+                video_vae=video_vae,
+                latent=get_value_at_index(av_latent_pass2, 0),
+                guide_data=None,
+                motion_guide_data=None,
+                model=model_g1 if model_g1 is not dit_model else dit_model,
+                upscale_factor=1.0,
+                node_id="pass2",
+            )
         del pos_cropped, neg_cropped, av_latent_pass2
+        # FIX 9 — cleanup after guide pass 2
         mem.cleanup()
+        # FIX 13 — proactive defrag before Pass 2 sampling (most OOM-prone point)
+        mem.defrag_if_needed(CONFIG.get("frag_defrag_threshold", 0.30))
         mem.warn_if_low()
-        print(f"  GPU before Pass2 sampling: {mem.gpu_free_gb():.2f} GB free")
+        print(f"  GPU before Pass2 sampling: {mem.gpu_free_gb():.2f} GB free  "
+              f"(frag {mem.fragment_score():.1%})")
 
         # ── 12. Sampling pass 2 ───────────────────────────────────────────────
-        sample_out_2 = run_sampling_pass(
-            model=model_g2,
-            pos_cond=pos_g2,
-            neg_cond=neg_g2,
-            latent=lat_g2,
-            noise_seed=0,          # workflow node 30: seed=0 for refinement pass
-            steps=WORKFLOW_STEPS,
-            cfg=WORKFLOW_CFG,
-            pass_name=f"Pass2 (chunk {idx})",
-        )
+        with memory_checkpoint("sample_pass2"):
+            sample_out_2 = run_sampling_pass(
+                model=model_g2,
+                pos_cond=pos_g2,
+                neg_cond=neg_g2,
+                latent=lat_g2,
+                noise_seed=0,          # workflow node 30: seed=0 for refinement pass
+                steps=WORKFLOW_STEPS,
+                cfg=WORKFLOW_CFG,
+                pass_name=f"Pass2 (chunk {idx})",
+            )
 
         del pos_g2, neg_g2, lat_g2, model_g2
         mem.cleanup()
@@ -2677,17 +2852,8 @@ def generate_chunk(
         del sample_out_2
         mem.soft_cleanup()
 
-        # ── 14. Reload video VAE on GPU for decode ────────────────────────────
-        if hasattr(video_vae, "to"):
-            try:
-                video_vae.to(DEVICE)
-            except Exception:
-                pass
-        if hasattr(audio_vae, "to"):
-            try:
-                audio_vae.to(DEVICE)
-            except Exception:
-                pass
+        # ── 14. Reload VAEs to GPU for decode (FIX 13 — via cache helper) ─────
+        reload_vaes_to_gpu()
 
         # ── 15. Decode video (CPU transfer happens inside) ────────────────────
         frames_cpu = decode_video_latent(final_video_lat, video_vae)
@@ -2697,8 +2863,8 @@ def generate_chunk(
         audio_cpu = decode_audio_latent(final_audio_lat, audio_vae)
         del final_audio_lat
 
-        # ── 17. Release VAEs ──────────────────────────────────────────────────
-        del video_vae, audio_vae
+        # ── 17. Offload VAEs back to CPU (FIX 13 — keep in cache, not deleted)
+        offload_vaes_to_cpu()
         mem.cleanup()
 
     # ── 18. Save chunk to disk ───────────────────────────────────────────────
@@ -2821,6 +2987,13 @@ def adaptive_chunk_generator(
                 save_checkpoint(checkpoint)
                 success = True
                 print(f"  ✓ Chunk {idx:04d} complete.")
+
+                # FIX 16 — brief sleep between chunks; lets the OS reclaim
+                # memory pages that Python/CUDA have released but not yet
+                # returned to the OS. Configurable via INTER_CHUNK_SLEEP_MS.
+                sleep_ms = CONFIG.get("inter_chunk_sleep_ms", 0)
+                if sleep_ms > 0:
+                    time.sleep(sleep_ms / 1000.0)
 
             except torch.cuda.OutOfMemoryError as oom:
                 retries += 1
@@ -3225,6 +3398,7 @@ def generate_preview(
     finally:
         del loaded_image, pos_cond, neg_cond
         release_dit_model()
+        release_vaes()         # FIX 13 — release VAE singleton cache
         _CONDITIONING_CACHE.clear()
         mem.aggressive_cleanup()
 
@@ -3527,8 +3701,9 @@ def generate_director_mv(
         dit_model=preloaded_dit,    # FIX 4: single model for all chunks
     )
 
-    # Release DiT and conditioning — no longer needed after all chunks done
+    # Release DiT, VAEs and conditioning — no longer needed after all chunks done
     release_dit_model()
+    release_vaes()             # FIX 13 — release VAE singleton cache
     del pos_cond, neg_cond, loaded_image
     _CONDITIONING_CACHE.clear()
     mem.aggressive_cleanup()
