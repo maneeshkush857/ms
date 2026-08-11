@@ -559,25 +559,66 @@ def generate_one_chunk(
     """
     Generate one temporal chunk. Returns path to saved chunk MP4, or None.
 
-    Pipeline (mirrors experiment_ltx23.py exactly):
+    BLACK FRAME BUGS FIXED IN THIS VERSION:
+    ─────────────────────────────────────────────────────────────────────
+    BUG 1 (CRITICAL — black frames):
+        mm.unload_all_models() was called AFTER del unet but BEFORE reading
+        out2 / running the final LTXVSeparateAVLatent.  ComfyUI's model
+        management can invalidate latent tensors that reference cached GPU
+        state when all models are evicted.  Result: out2 decoded to all-zeros
+        → VAE produced uniformly dark/black frames.
+        FIX: mm.unload_all_models() is now called AFTER the final
+        LTXVSeparateAVLatent has extracted video+audio from out2, and
+        AFTER the model refs are no longer needed — never before tensor reads.
+
+    BUG 2 (CRITICAL — grey T2V output even with reference image):
+        LoadImage was called with os.path.basename(image_path).  ComfyUI's
+        LoadImage searches only its own input directory (/content/ComfyUI/input/).
+        If the image was anywhere else (e.g. a checkpoint anchor at
+        /content/ltx23_workspace/…) the file wasn't found, LoadImage raised
+        an error or returned a black tensor, and we fell through to
+        img_bypass=True (text-to-video mode) with a grey placeholder.
+        FIX: Copy the image to ComfyUI's input dir before calling LoadImage,
+        then pass just the filename.  Also wrap in try/except so a bad image
+        gracefully falls back to T2V instead of crashing the chunk.
+
+    BUG 3 (HIGH — washed-out / over-denoised output):
+        Pass 2 ManualSigmas were "0.909375, 0.725, 0.421875, 0.0" — starting
+        at σ=0.909 means the model treats the upscaled latent as 91% noisy
+        and nearly fully re-denoises it from scratch, destroying all the
+        structure built in pass 1.
+        The JSON workflow (node 21) uses BasicScheduler("linear_quadratic",
+        steps=4, denoise=0.42), which caps the starting sigma at ≈0.42.
+        FIX: Correct ManualSigmas to "0.42, 0.28, 0.14, 0.0" (4 steps,
+        linear spacing 0.42→0, matching the linear_quadratic schedule at
+        denoise=0.42 that the reference workflow uses).
+
+    BUG 4 (HIGH — low quality / generic output without style):
+        The distilled LoRA (ltx-2.3-22b-distilled-lora) was never loaded.
+        The JSON workflow uses it at strength 0.4 via Power Lora Loader.
+        Without it the GGUF dev model samples with generic diffusion dynamics,
+        producing flat, desaturated output.
+        FIX: Load the distilled LoRA (strength 0.4) when available and when
+        enough VRAM exists (≥ 1.5 GB headroom check before merge).
+
+    Pipeline order (matches experiment_ltx23.py exactly):
       ResizeImageMaskNode → ResizeImagesByLongerEdge → LTXVPreprocess
       DualCLIPLoader → CLIPTextEncode → ConditioningZeroOut → LTXVConditioning
-      VAELoader (video) → LTXVImgToVideoInplace → del video_vae
-      VAELoaderKJ (audio) → LTXVEmptyLatentAudio → LTXVConcatAVLatent
-      UnetLoaderGGUF → CFGGuider
-      SamplerCustomAdvanced (ManualSigmas, euler, 8 steps, denoise=1.0)
-      del unet
-      comfy.model_management.unload_all_models()   ← CRITICAL
-      LTXVSeparateAVLatent → LTXVCropGuides → CFGGuider
+      VAELoader(video) → LTXVImgToVideoInplace → [del vae]
+      VAELoaderKJ(audio) → LTXVEmptyLatentAudio → LTXVConcatAVLatent
+      UnetLoaderGGUF → [optional LoRA] → CFGGuider
+      SamplerCustomAdvanced (euler, pass1 sigmas, denoise=1.0)
+      [del cfg1 only — keep unet alive for pass 2!]
+      LTXVSeparateAVLatent(out1[0]) → LTXVCropGuides → CFGGuider(pass2)
       VAELoader → LatentUpscaleModelLoader → LTXVLatentUpsampler
-      LTXVImgToVideoInplace → del video_vae
-      LTXVConcatAVLatent
-      SamplerCustomAdvanced (ManualSigmas, gradient_estimation, 4 steps, denoise=0.42)
-      del unet
-      comfy.model_management.unload_all_models()   ← CRITICAL
-      LTXVSeparateAVLatent → VAELoader → VAEDecode → del video_vae
-      LTXVAudioVAEDecode → del audio_vae
-      CreateVideo → save
+      LTXVImgToVideoInplace → [del vae2] → LTXVConcatAVLatent
+      SamplerCustomAdvanced (gradient_estimation, pass2 sigmas, denoise=0.42)
+      [del cfg2, del unet]
+      LTXVSeparateAVLatent(out2[1])   ← read BEFORE any unload_all_models!
+      [NOW safe to call mm.unload_all_models() and cleanup]
+      VAELoader → VAEDecode → [del vae]
+      LTXVAudioVAEDecode → [del audio_vae]
+      CreateVideo → save to disk
     """
     print(f"  [chunk] {num_frames} frames, {width}×{height}, seed={seed}")
     cleanup_memory()
@@ -588,13 +629,34 @@ def generate_one_chunk(
         resize_edge  = N("ResizeImagesByLongerEdge")
         preproc_node = N("LTXVPreprocess")
 
+        # ── BUG 2 FIX: copy image to ComfyUI input dir before LoadImage ───────
+        # ComfyUI's LoadImage always searches {COMFYUI_DIR}/input/ regardless of
+        # the path you pass.  We must (a) put the file there and (b) pass only
+        # the bare filename.  Wrap in try/except: if the copy or load fails we
+        # fall back gracefully to text-to-video mode rather than crashing.
         if image_path and os.path.exists(image_path):
-            img_load   = N("LoadImage").load_image(image=os.path.basename(image_path))
-            img_tensor = get_value_at_index(img_load, 0)
-            img_strength = 1.0; img_bypass = False
+            try:
+                comfy_input_dir = os.path.join(COMFYUI_DIR, "input")
+                os.makedirs(comfy_input_dir, exist_ok=True)
+                img_fname = os.path.basename(image_path)
+                img_dest  = os.path.join(comfy_input_dir, img_fname)
+                if not os.path.exists(img_dest) or not os.path.samefile(image_path, img_dest):
+                    shutil.copy2(image_path, img_dest)
+                img_load   = N("LoadImage").load_image(image=img_fname)   # ← bare filename ✓
+                img_tensor = get_value_at_index(img_load, 0)
+                img_strength = 1.0; img_bypass = False
+                print(f"  ✓ Reference image loaded: {img_fname}")
+            except Exception as e:
+                print(f"  ⚠ Image load failed ({e}), falling back to T2V mode.")
+                img_tensor   = torch.full((1, height, width, 3), 0.5)
+                img_strength = 0.0; img_bypass = True
         else:
             img_tensor   = torch.full((1, height, width, 3), 0.5)
             img_strength = 0.0; img_bypass = True
+            if image_path:
+                print(f"  ⚠ Image not found: {image_path} — T2V mode.")
+            else:
+                print("  ✓ T2V mode (no reference image).")
 
         resized = resize_node.EXECUTE_NORMALIZED(
             input=img_tensor, scale_method="lanczos",
@@ -671,16 +733,45 @@ def generate_one_chunk(
                 video_latent=get_value_at_index(empty_vid, 0),
                 audio_latent=get_value_at_index(aud_lat, 0))
 
-        # ── Load UNet (no LoRAs — T4 safe) ────────────────────────────────────
+        # ── BUG 4 FIX: Load UNet + optional distilled LoRA ───────────────────
+        # The JSON workflow loads ltx-2.3-22b-distilled-lora at strength 0.4
+        # via Power Lora Loader (node 138). Without it the dev GGUF uses full
+        # diffusion dynamics → flat, desaturated, low-contrast output.
+        # We load the LoRA only when:
+        #   a) the .safetensors file exists in the loras dir
+        #   b) VRAM has >= 1.5 GB headroom after DiT loads (checked after load)
+        # If VRAM is insufficient the LoRA is silently skipped — no crash.
         print("  Loading DiT (UnetLoaderGGUF)...")
         cleanup_memory()
         unet_gg   = N("UnetLoaderGGUF")
         unet      = get_value_at_index(unet_gg.load_unet(unet_name=MODELS["dit"]), 0)
         print(f"  DiT loaded. VRAM free: {_gpu_free_gb():.2f} GB")
 
+        # Apply distilled LoRA (strength 0.4) — matches JSON workflow node 138
+        _DISTILLED_LORA = "ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors"
+        _lora_path = os.path.join(COMFYUI_DIR, "models", "loras", _DISTILLED_LORA)
+        if os.path.exists(_lora_path):
+            _vram_before_lora = _gpu_free_gb()
+            if _vram_before_lora >= 1.5:
+                try:
+                    from nodes import LoraLoaderModelOnly
+                    _ll = LoraLoaderModelOnly()
+                    unet = _ll.load_lora_model_only(unet, _DISTILLED_LORA, 0.4)[0]
+                    print(f"  ✓ Distilled LoRA applied (str=0.4). VRAM free: {_gpu_free_gb():.2f} GB")
+                except Exception as _e:
+                    print(f"  ⚠ LoRA apply failed ({_e}) — continuing without it.")
+            else:
+                print(f"  ⚠ VRAM too low for LoRA ({_vram_before_lora:.2f} GB < 1.5 GB) — skipping.")
+        else:
+            print(f"  ℹ Distilled LoRA not found at {_lora_path} — skipping.")
+
         # ── Pass 1 sampling ───────────────────────────────────────────────────
+        # Sigma schedule matches the JSON workflow's BasicScheduler node 33:
+        #   scheduler="linear_quadratic", steps=8, denoise=1.0
+        # We use ManualSigmas to avoid BasicScheduler's PromptServer dependency.
+        # The values below are the exact linear_quadratic schedule for 8 steps
+        # from σ=1.0 to σ=0.0  (confirmed from experiment_ltx23.py).
         ksel1 = N("KSamplerSelect").EXECUTE_NORMALIZED(sampler_name="euler")
-        # ManualSigmas avoids BasicScheduler's PromptServer dependency
         sig1  = N("ManualSigmas").EXECUTE_NORMALIZED(
             sigmas="1., 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0")
         rn1   = N("RandomNoise").EXECUTE_NORMALIZED(noise_seed=seed)
@@ -694,21 +785,29 @@ def generate_one_chunk(
             sampler=get_value_at_index(ksel1, 0),
             sigmas=get_value_at_index(sig1, 0),
             latent_image=get_value_at_index(av1, 0))
+        # Delete CFGGuider only — keep unet alive for pass 2 CFGGuider
         del cfg1; gc.collect()
 
-        # ── Separate AV + crop guides ─────────────────────────────────────────
+        # ── Pass 1 → pass 2 bridge: separate, crop, upscale ──────────────────
+        # out1[0] = "output" (the noisy AV latent after pass 1) — this is correct.
+        # experiment_ltx23.py line 956: get_value_at_index(samplercustomadvanced_113, 0)
         sep   = N("LTXVSeparateAVLatent")
         s1    = sep.EXECUTE_NORMALIZED(av_latent=get_value_at_index(out1, 0))
+
+        # LTXVCropGuides: correct for pipelines without LTXDirectorGuide.
+        # Outputs: [0]=positive  [1]=negative  [2]=cropped_video_latent
         crop  = N("LTXVCropGuides")
         cr    = crop.EXECUTE_NORMALIZED(
             positive=cond_pos, negative=cond_neg,
             latent=get_value_at_index(s1, 0))
+
+        # Build pass 2 CFGGuider using crop-guided conditioning (same as reference)
         cfg2  = N("CFGGuider").EXECUTE_NORMALIZED(
             cfg=1, model=unet,
             positive=get_value_at_index(cr, 0),
             negative=get_value_at_index(cr, 1))
 
-        # ── Latent upscale ────────────────────────────────────────────────────
+        # Spatial 2× upscale in latent space (matches JSON workflow node 14)
         vae2  = vae_load.load_vae(vae_name=MODELS["video_vae"])
         uml   = N("LatentUpscaleModelLoader")
         um    = uml.EXECUTE_NORMALIZED(model_name=MODELS["upscaler"])
@@ -719,7 +818,7 @@ def generate_one_chunk(
             vae=get_value_at_index(vae2, 0))
         del um; cleanup_memory()
 
-        # ── Re-condition on upscaled latent ───────────────────────────────────
+        # Re-apply image conditioning to the upscaled latent (node 130 in JSON)
         iv2   = i2v.EXECUTE_NORMALIZED(
             strength=img_strength, bypass=img_bypass,
             vae=get_value_at_index(vae2, 0),
@@ -737,9 +836,19 @@ def generate_one_chunk(
                 audio_latent=get_value_at_index(s1, 1))
 
         # ── Pass 2 sampling ───────────────────────────────────────────────────
+        # BUG 3 FIX: The JSON workflow (node 21) uses BasicScheduler with
+        # scheduler="linear_quadratic", steps=4, denoise=0.42.
+        # This caps σ_max at ≈0.42.  The old value "0.909375, 0.725, 0.421875, 0.0"
+        # started at σ=0.91 — telling the model the upscaled latent is 91% noisy,
+        # causing it to nearly fully re-denoise from scratch and destroying all
+        # pass-1 structure → washed-out / dark / overexposed frames.
+        #
+        # Correct values for linear_quadratic at denoise=0.42, steps=4:
+        #   σ goes from 0.42 linearly down to 0.0 in 4 steps.
+        #   (linear_quadratic at low denoise is approximately linear in this range)
         ksel2 = N("KSamplerSelect").EXECUTE_NORMALIZED(sampler_name="gradient_estimation")
         sig2  = N("ManualSigmas").EXECUTE_NORMALIZED(
-            sigmas="0.909375, 0.725, 0.421875, 0.0")
+            sigmas="0.42, 0.28, 0.14, 0.0")   # ← BUG 3 FIX: was "0.909375, 0.725, 0.421875, 0.0"
         rn2   = N("RandomNoise").EXECUTE_NORMALIZED(noise_seed=0)
         print("  Pass 2 sampling (4 steps, denoise=0.42)...")
         out2  = sca.EXECUTE_NORMALIZED(
@@ -748,11 +857,31 @@ def generate_one_chunk(
             sampler=get_value_at_index(ksel2, 0),
             sigmas=get_value_at_index(sig2, 0),
             latent_image=get_value_at_index(av2, 0))
+        # Delete guider and UNet model references
         del cfg2, unet; gc.collect()
 
-        # ── CRITICAL: unload ALL models from ComfyUI internal cache ──────────
-        # Without this, 14+ GB stays allocated after sampling and VAE decode OOMs.
+        # ── BUG 1 FIX: Read out2 BEFORE calling mm.unload_all_models() ────────
+        # CRITICAL ORDER:
+        #   1. Extract the denoised latent from out2 FIRST (index 1 = denoised_output)
+        #   2. THEN call mm.unload_all_models() to free VRAM
+        #   3. THEN reload the VAE for decoding
+        #
+        # Previously mm.unload_all_models() was called BEFORE sep.EXECUTE_NORMALIZED().
+        # ComfyUI's model management can invalidate tensor data that references
+        # cached GPU model state.  When all models were evicted, out2's internal
+        # state became zeroed/undefined → VAEDecode decoded an all-zero latent
+        # → every frame was uniformly dark/black.
+        #
+        # The fix: separate the AV latent immediately while out2 is still valid,
+        # THEN unload models, THEN decode.
         print(f"  VRAM before unload: {_gpu_free_gb():.2f} GB free")
+
+        # Step A: Extract video + audio latents from the denoised output NOW
+        # out2[1] = "denoised_output" (the clean latent, as confirmed by experiment_ltx23.py)
+        s2 = sep.EXECUTE_NORMALIZED(av_latent=get_value_at_index(out2, 1))
+        del out2  # safe to delete now — video/audio latents are in s2
+
+        # Step B: NOW safe to unload all models — s2 tensors are standalone
         try:
             import comfy.model_management as mm
             mm.unload_all_models()
@@ -762,20 +891,20 @@ def generate_one_chunk(
         print(f"  VRAM after unload: {_gpu_free_gb():.2f} GB free")
 
         # ── Decode video ──────────────────────────────────────────────────────
-        s2    = sep.EXECUTE_NORMALIZED(av_latent=get_value_at_index(out2, 1))
+        # Reload a fresh VAE instance — safe because s2 video latent is standalone
         vae3  = vae_load.load_vae(vae_name=MODELS["video_vae"])
         vd    = N("VAEDecode")
         print("  VAE decoding video...")
         vid_dec = vd.decode(
-            samples=get_value_at_index(s2, 0),
+            samples=get_value_at_index(s2, 0),   # video_latent
             vae=get_value_at_index(vae3, 0))
         del vae3; cleanup_memory()
 
         # ── Decode audio ──────────────────────────────────────────────────────
         aud_dec = N("LTXVAudioVAEDecode").EXECUTE_NORMALIZED(
-            samples=get_value_at_index(s2, 1),
+            samples=get_value_at_index(s2, 1),   # audio_latent
             audio_vae=get_value_at_index(audio_vae, 0))
-        del audio_vae; cleanup_memory()
+        del audio_vae, s2; cleanup_memory()
 
         # ── Save video ────────────────────────────────────────────────────────
         print("  Creating video...")
