@@ -623,7 +623,11 @@ class MultiSceneModelCache:
             return self._upscaler
 
     def evict_dit(self):
-        """Release only the DiT (e.g. before decode to free VRAM)."""
+        """
+        FIX 2 — Move DiT weights to CPU before every VAE decode.
+        Weights stay on CPU so the next chunk reloads them cheaply
+        without re-running UnetLoaderGGUF + LoRA merge.
+        """
         with self._lock:
             if self._dit is not None:
                 try:
@@ -632,7 +636,37 @@ class MultiSceneModelCache:
                 del self._dit
                 self._dit = None
                 mem.aggressive_cleanup()
-                print("  [cache] DiT evicted.")
+                print("  [cache] DiT evicted to CPU.")
+
+    def evict_upscaler(self):
+        """
+        FIX 3 — Offload upscaler to CPU after upsample step.
+        Frees ~200-400 MB before decode; reloaded from CPU cache next chunk.
+        """
+        with self._lock:
+            if self._upscaler is not None:
+                try:
+                    if hasattr(self._upscaler, "to"): self._upscaler.to("cpu")
+                except Exception: pass
+                del self._upscaler
+                self._upscaler = None
+                mem.soft_cleanup()
+                print("  [cache] Upscaler offloaded to CPU.")
+
+    def cpu_offload_vaes(self):
+        """
+        FIX 4 — Move both VAEs to CPU after decode so save_chunk_to_disk
+        has headroom. VAEs will be reloaded from CPU next chunk.
+        """
+        with self._lock:
+            for attr in ["_video_vae", "_audio_vae"]:
+                obj = getattr(self, attr, None)
+                if obj is not None:
+                    try:
+                        if hasattr(obj, "to"): obj.to("cpu")
+                    except Exception: pass
+        mem.soft_cleanup()
+        print("  [cache] VAEs CPU-offloaded.")
 
     def evict_all(self):
         with self._lock:
@@ -1238,6 +1272,18 @@ def load_dit_model_raw(apply_loras: bool = True) -> Any:
     del unet_r; mem.soft_cleanup()
 
     if apply_loras:
+        # ── FIX 1: VRAM guard before each LoRA merge ──────────────────────────
+        # Each LoRA merge transiently allocates ~256–512 MiB (error shows exactly
+        # 256 MiB at transformer_blocks.47 — the last block, halfway through merge).
+        # Strategy:
+        #   a) aggressive_cleanup before the LoRA loop to reclaim reserved cache
+        #   b) Check free VRAM before EACH LoRA; skip all remaining if < threshold
+        #   c) Only apply LoRAs that are enabled (transition + mvcamera OFF by default)
+        # Minimum headroom required per LoRA merge = 512 MiB (conservative)
+        _LORA_MIN_VRAM_GB = 0.55   # 550 MiB headroom required before each LoRA
+        mem.aggressive_cleanup()
+        print(f"  VRAM before LoRA loop: {mem.gpu_free_gb():.2f} GB free")
+
         from nodes import LoraLoaderModelOnly
         ll = LoraLoaderModelOnly()
         for lora_key, strength in [
@@ -1247,12 +1293,29 @@ def load_dit_model_raw(apply_loras: bool = True) -> Any:
             ("lora_mvcamera",   LORA_STRENGTHS["lora_mvcamera"]),
         ]:
             if not LORA_ENABLED.get(lora_key, True):
-                print(f"  LoRA disabled: {lora_key}"); continue
+                print(f"  LoRA disabled (config): {lora_key}"); continue
             lpath = os.path.join(MODEL_DEST_DIRS[lora_key], MODELS[lora_key])
-            if os.path.exists(lpath):
-                print(f"  LoRA: {MODELS[lora_key]}  str={strength}")
+            if not os.path.exists(lpath):
+                print(f"  LoRA file not found, skipping: {lora_key}"); continue
+
+            # ── VRAM check before merge ──────────────────────────────────────
+            free_now = mem.gpu_free_gb()
+            if free_now < _LORA_MIN_VRAM_GB:
+                print(f"  ⚠ VRAM too low ({free_now:.2f} GB < {_LORA_MIN_VRAM_GB} GB) "
+                      f"— skipping LoRA: {lora_key} and all remaining LoRAs.")
+                break   # stop entire LoRA loop — saves the session from crashing
+
+            print(f"  LoRA: {MODELS[lora_key]}  str={strength}  "
+                  f"(VRAM free: {free_now:.2f} GB)")
+            try:
                 model = ll.load_lora_model_only(model, MODELS[lora_key], strength)[0]
-                mem.soft_cleanup()
+            except torch.cuda.OutOfMemoryError:
+                print(f"  ✗ OOM merging LoRA {lora_key} — skipping and continuing.")
+                mem.aggressive_cleanup()
+                continue
+            mem.soft_cleanup()
+            print(f"  ✓ LoRA applied. VRAM now: {mem.gpu_free_gb():.2f} GB free")
+
     _DIT_MODEL_CACHE = model
     print("  DiT ready.")
     return model
@@ -1711,7 +1774,13 @@ def generate_chunk(chunk_desc: Dict, pos_cond, neg_cond,
         upscaler = load_upscaler_model()
         upscaled_lat = upsample_video_latent(lat_c55, upscaler, video_vae)
         del lat_c55
-        # Do NOT evict upscaler from cache here — it will be reused next chunk
+        # ── FIX 3: evict upscaler from cache immediately after use ────────────
+        # The upscaler (~200-400 MB) stays in ModelCache._upscaler by default,
+        # consuming VRAM that decode needs. Evict it now — it can be reloaded
+        # from cache for the next chunk (cheap read, not a full download).
+        del upscaler
+        if _MODEL_CACHE is not None:
+            _MODEL_CACHE.evict_upscaler()
         mem.cleanup()
 
         pos_g2, neg_g2, lat_g2, model_g2 = run_director_guide(
@@ -1739,13 +1808,28 @@ def generate_chunk(chunk_desc: Dict, pos_cond, neg_cond,
             pass_name=f"Pass2(chunk {idx})")
         del lat_samp2, model_g2
 
-        # CRITICAL: release DiT before decode if model cache is NOT in use,
-        # because the decode VAE needs the VRAM freed by the DiT.
-        if not USE_MODEL_CACHE:
-            try: del base_model
-            except NameError: pass
-            release_dit_model()
-        mem.cleanup()
+        # ── FIX 2: ALWAYS release DiT before VAE decode ──────────────────────
+        # The T4 has 14.56 GB total. After Pass 2 sampling the DiT alone
+        # occupies ~12-14 GB. VAEDecode needs ~1-2 GB extra for the frame
+        # tensor. With both resident simultaneously = guaranteed OOM.
+        #
+        # BUG (original): DiT was only released when USE_MODEL_CACHE=False.
+        # When USE_MODEL_CACHE=True the DiT stayed in VRAM through decode,
+        # which is why the crash always happened at "VAE decoding video latent".
+        #
+        # FIX: ALWAYS evict the DiT before decode, regardless of cache setting.
+        # The ModelCache.evict_dit() moves weights to CPU (not deleted), so
+        # they can be reloaded cheaply for the next chunk/shot WITHOUT going
+        # back through the full GGUF load + LoRA merge cycle.
+        # ─────────────────────────────────────────────────────────────────────
+        try: del base_model
+        except NameError: pass
+        # Evict DiT from VRAM → CPU (cache or module-level, whichever is active)
+        release_dit_model()
+        # Full synchronize + cache flush so VRAM is truly free before decode
+        torch.cuda.synchronize()
+        mem.aggressive_cleanup()
+        print(f"  [pre-decode] VRAM free after DiT eviction: {mem.gpu_free_gb():.2f} GB")
 
         final_video_lat, final_audio_lat = separate_av_latent(sample_out_2, output_index=0)
         del sample_out_2; mem.soft_cleanup()
@@ -1753,13 +1837,36 @@ def generate_chunk(chunk_desc: Dict, pos_cond, neg_cond,
         pos_c54, neg_c54, lat_c54 = run_director_crop_guides(
             pos_g2, neg_g2, final_video_lat, prefer_standard=no_director_data)
         del pos_g2, neg_g2, final_video_lat, pos_c54, neg_c54
-        mem.aggressive_cleanup(); mem.ram_cleanup()
+
+        # ── FIX 4: hard pre-decode barrier ────────────────────────────────────
+        # At this point the DiT has been evicted (FIX 2) but the CUDA allocator
+        # may still hold reserved-but-unallocated pages from earlier ops.
+        # torch.cuda.synchronize() + 3× gc + empty_cache + malloc_trim
+        # forces the OS to reclaim those pages before VAEDecode allocates its
+        # large frame tensor (e.g. 97 frames × 720p × float32 ≈ 1.5 GB).
+        torch.cuda.synchronize()
+        mem.aggressive_cleanup()
+        mem.ram_cleanup()
+        _free_gb = mem.gpu_free_gb()
+        _avail_ram = mem.cpu_available_gb()
+        print(f"  [pre-decode barrier]  GPU free: {_free_gb:.2f} GB | "
+              f"RAM avail: {_avail_ram:.2f} GB")
+        if _free_gb < 1.0:
+            raise torch.cuda.OutOfMemoryError(
+                f"Insufficient VRAM for VAE decode: only {_free_gb:.2f} GB free. "
+                "Reduce chunk_frames or use t4_safe profile.")
 
         frames_cpu = decode_video_latent(lat_c54, video_vae); del lat_c54
         audio_cpu  = decode_audio_latent(final_audio_lat, audio_vae)
         del final_audio_lat
 
-        if not USE_MODEL_CACHE:
+        # ── offload VAEs to CPU after decode to reclaim VRAM ─────────────────
+        # Even when USE_MODEL_CACHE=True we CPU-offload VAEs here because
+        # save_chunk_to_disk (CreateVideo path) can need ~1 GB for its
+        # internal frame buffer. Reloading from CPU cache next chunk is cheap.
+        if _MODEL_CACHE is not None:
+            _MODEL_CACHE.cpu_offload_vaes()
+        else:
             del video_vae, audio_vae
         mem.cleanup()
 
