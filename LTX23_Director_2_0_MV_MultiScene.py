@@ -73,8 +73,32 @@ LORA_STRENGTH_DISTILLED  = 0.4   # @param {type:"slider",min:0.0,max:2.0,step:0.
 LORA_STRENGTH_OMNINFT    = 0.6   # @param {type:"slider",min:0.0,max:2.0,step:0.05}
 LORA_STRENGTH_TRANSITION = 0.7   # @param {type:"slider",min:0.0,max:2.0,step:0.05}
 LORA_STRENGTH_MVCAMERA   = 0.9   # @param {type:"slider",min:0.0,max:2.0,step:0.05}
-ENABLE_LORA_DISTILLED    = True  # @param {type:"boolean"}
-ENABLE_LORA_OMNINFT      = True  # @param {type:"boolean"}
+# ── T4 VRAM reality check ──────────────────────────────────────────────────
+# LTX-2.3 22B GGUF (Q4_K_M) alone loads to ~12.5 GB on a 14.56 GB T4.
+# Each LoRA merge (LoraLoaderModelOnly) adds ~400-800 MB of merged weight
+# copies ON TOP of the base model — the strength value does NOT reduce
+# peak VRAM; only enabling/disabling the LoRA does.
+#
+# Observed behaviour without this fix:
+#   After sampling completes, ComfyUI's internal model_management tries to
+#   keep the model warm by re-applying LoRA deltas. With only ~230 MB free,
+#   every single transformer_blocks.N layer fails with:
+#     "ERROR lora ... CUDA out of memory. Tried to allocate 256 MiB"
+#   (48 transformer blocks × 2 attempts = ~100 identical OOM lines in log)
+#   Then adaln_single.linear fails trying to allocate 576 MiB.
+#   The session then crashes during VAE decode.
+#
+# Safe configuration for T4 (14.56 GB):
+#   22B GGUF base only        → ~12.5 GB  (~2.0 GB headroom for sampling) ✅
+#   + lora_distilled          → ~12.9 GB  (~1.6 GB headroom)              ✅
+#   + lora_omninft            → ~13.3 GB  (~1.2 GB headroom — borderline)  ⚠️
+#   + lora_transition         → ~13.7 GB  (~0.8 GB headroom — OOM risk)   ❌
+#   + lora_mvcamera           → ~14.1 GB  (~0.4 GB headroom — guaranteed OOM) ❌
+#
+# DEFAULT for t4_safe: ALL LoRAs OFF. The distilled base model generates
+# good quality video without any LoRAs on T4. Enable them only on A100/L4.
+ENABLE_LORA_DISTILLED    = False # @param {type:"boolean"} — OFF on T4 (saves ~400MB, prevents ComfyUI LoRA-flood OOM)
+ENABLE_LORA_OMNINFT      = False # @param {type:"boolean"} — OFF on T4
 ENABLE_LORA_TRANSITION   = False # @param {type:"boolean"}
 ENABLE_LORA_MVCAMERA     = False # @param {type:"boolean"}
 
@@ -1326,12 +1350,52 @@ def load_dit_model(apply_loras: bool = True) -> Any:
     return load_dit_model_raw(apply_loras)
 
 def release_dit_model():
+    """
+    Release the DiT from ALL caches — both ours and ComfyUI's internal one.
+
+    THE ROOT CAUSE of the LoRA-flood OOM (transformer_blocks.0..47 all failing):
+    After SamplerCustomAdvanced completes, ComfyUI's model_management module
+    still holds the loaded DiT + merged LoRA weights in its internal
+    `current_loaded_models` list.  Our Python-level del / .to('cpu') only
+    removes our reference; it does NOT trigger ComfyUI to evict the model
+    from CUDA.  The result: 14.09 GB remains allocated after sampling, only
+    ~230 MB free, and every subsequent operation (upscaler load, crop guides,
+    separate_av, VAE load) triggers a new ComfyUI "try to make room" pass
+    that repeatedly attempts to re-apply LoRA deltas — each needs 256 MB it
+    doesn't have → hundreds of ERROR lora ... OOM messages in the log.
+
+    Fix: call comfy.model_management.unload_all_models() which iterates
+    comfy's current_loaded_models list and moves everything to CPU (or deletes
+    it if the model has no persistent reference), then empties the CUDA cache.
+    This is the ONLY way to actually free the DiT VRAM under ComfyUI.
+    """
     global _DIT_MODEL_CACHE
+    # ── Step 1: remove our Python references ─────────────────────────────────
     if _MODEL_CACHE is not None:
-        _MODEL_CACHE.evict_dit(); _DIT_MODEL_CACHE = None
-    elif _DIT_MODEL_CACHE is not None:
-        del _DIT_MODEL_CACHE; _DIT_MODEL_CACHE = None
-        mem.aggressive_cleanup(); print("  DiT released.")
+        _MODEL_CACHE.evict_dit()
+    if _DIT_MODEL_CACHE is not None:
+        try:
+            if hasattr(_DIT_MODEL_CACHE, "to"):
+                _DIT_MODEL_CACHE.to("cpu")
+        except Exception: pass
+        del _DIT_MODEL_CACHE
+    _DIT_MODEL_CACHE = None
+
+    # ── Step 2: tell ComfyUI to unload ALL models from its internal registry ─
+    # This is the critical step that actually frees the CUDA memory.
+    # Without this, comfy.model_management.current_loaded_models still holds
+    # the DiT + LoRA tensors on GPU regardless of our del above.
+    try:
+        import comfy.model_management as mm
+        mm.unload_all_models()
+        print("  [release_dit] comfy.model_management.unload_all_models() called.")
+    except Exception as e:
+        print(f"  [release_dit] comfy.model_management not available: {e}")
+
+    # ── Step 3: full CUDA cache flush ─────────────────────────────────────────
+    torch.cuda.synchronize()
+    mem.aggressive_cleanup()
+    print(f"  [release_dit] VRAM free after full unload: {mem.gpu_free_gb():.2f} GB")
 
 def _load_video_vae_raw() -> Any:
     print("  Loading video VAE..."); vl = get_node("VAELoader")
@@ -1838,23 +1902,54 @@ def generate_chunk(chunk_desc: Dict, pos_cond, neg_cond,
             pos_g2, neg_g2, final_video_lat, prefer_standard=no_director_data)
         del pos_g2, neg_g2, final_video_lat, pos_c54, neg_c54
 
-        # ── FIX 4: hard pre-decode barrier ────────────────────────────────────
-        # At this point the DiT has been evicted (FIX 2) but the CUDA allocator
-        # may still hold reserved-but-unallocated pages from earlier ops.
-        # torch.cuda.synchronize() + 3× gc + empty_cache + malloc_trim
-        # forces the OS to reclaim those pages before VAEDecode allocates its
-        # large frame tensor (e.g. 97 frames × 720p × float32 ≈ 1.5 GB).
-        torch.cuda.synchronize()
-        mem.aggressive_cleanup()
-        mem.ram_cleanup()
-        _free_gb = mem.gpu_free_gb()
-        _avail_ram = mem.cpu_available_gb()
-        print(f"  [pre-decode barrier]  GPU free: {_free_gb:.2f} GB | "
-              f"RAM avail: {_avail_ram:.2f} GB")
-        if _free_gb < 1.0:
+        # ── FIX C: hard pre-decode barrier with 3 GB minimum ─────────────────
+        #
+        # WHY 3 GB (not 1 GB):
+        #   The log showed "GPU free: 1.40 GB" right before the crash.
+        #   VAEDecode for a 49-frame 832×480 chunk needs roughly:
+        #     latent tensor in:   49 × 60 × 106 × 16 channels × 2B (bf16) ≈ 0.10 GB
+        #     intermediate acts:  ~0.8 GB (upsampling pipeline inside VAE)
+        #     output pixel tensor: 49 × 480 × 832 × 3 × 4B (fp32) ≈ 0.23 GB
+        #     CUDA kernel buffers: ~0.4 GB (cuDNN workspace etc.)
+        #     Total minimum safe headroom: ~1.6 GB
+        #   We set 3 GB to include the audio VAE decode that immediately follows,
+        #   plus the CreateVideo / ffmpeg-pipe buffer for save_chunk_to_disk.
+        #
+        # WHAT HAPPENS if < 3 GB:
+        #   Instead of crashing we retry the cleanup loop up to 3 times,
+        #   calling comfy.model_management.unload_all_models() on each attempt.
+        #   If still < 3 GB after retries, raise OutOfMemoryError so the
+        #   adaptive_chunk_generator OOM retry loop can catch it and reduce
+        #   the chunk size rather than crashing the session.
+        #
+        _MIN_DECODE_VRAM_GB = 3.0
+        for _barrier_attempt in range(3):
+            torch.cuda.synchronize()
+            mem.aggressive_cleanup()
+            mem.ram_cleanup()
+            # Second comfy unload pass — catches any model that was loaded
+            # by crop_guides or separate_av after our first release_dit_model()
+            try:
+                import comfy.model_management as _mm
+                _mm.unload_all_models()
+            except Exception: pass
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            _free_gb  = mem.gpu_free_gb()
+            _avail_ram = mem.cpu_available_gb()
+            print(f"  [pre-decode barrier attempt {_barrier_attempt+1}/3]  "
+                  f"GPU free: {_free_gb:.2f} GB | RAM avail: {_avail_ram:.2f} GB")
+            if _free_gb >= _MIN_DECODE_VRAM_GB:
+                break
+            # Still not enough — wait one GC cycle and try again
+            import time as _time
+            _time.sleep(0.5)
+        else:
+            # All 3 attempts exhausted
             raise torch.cuda.OutOfMemoryError(
-                f"Insufficient VRAM for VAE decode: only {_free_gb:.2f} GB free. "
-                "Reduce chunk_frames or use t4_safe profile.")
+                f"Pre-decode barrier: only {_free_gb:.2f} GB free after 3 cleanup "
+                f"attempts (need >= {_MIN_DECODE_VRAM_GB} GB). "
+                "Reduce chunk_frames, disable LoRAs, or use t4_safe profile.")
 
         frames_cpu = decode_video_latent(lat_c54, video_vae); del lat_c54
         audio_cpu  = decode_audio_latent(final_audio_lat, audio_vae)
