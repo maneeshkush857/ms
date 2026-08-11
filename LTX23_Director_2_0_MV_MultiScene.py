@@ -329,6 +329,42 @@ def download_all_models():
 
 _NODES_LOADED = False
 
+class _MockNodeReplaceManager:
+    """Stand-in for the node replacement manager used by nodes_replacements.py."""
+    def register(self, *a, **kw): pass
+    def get(self, *a, **kw): return None
+
+
+class _MockQueue:
+    """Minimal stand-in for PromptQueue used by VideoHelperSuite."""
+    def __init__(self):
+        self.currently_running = {}
+    def get_current_queue(self):
+        return ([], [])
+
+class _MockRoutes:
+    """
+    Minimal stand-in for the aiohttp RouteTableDef used by:
+      - ComfyUI-Manager (manager_server.py)
+      - rgthree-comfy   (routes_config.py)
+      - WhatDreamsCost  (load_video_ui.py)
+      - ComfyUI-LTXDirector (load_video_ui.py)
+    All of these call .routes.get(path) or .routes.post(path) as decorators.
+    We return a no-op decorator so the decorated function is registered but
+    never called (there is no web server in headless mode).
+    """
+    def _noop_decorator(self, path, **kw):
+        def decorator(fn):
+            return fn
+        return decorator
+
+    def get(self, path, **kw):    return self._noop_decorator(path)
+    def post(self, path, **kw):   return self._noop_decorator(path)
+    def put(self, path, **kw):    return self._noop_decorator(path)
+    def delete(self, path, **kw): return self._noop_decorator(path)
+    def add_route(self, *a, **kw): pass
+    def freeze(self): pass
+
 class _MockRouter:
     frozen = True
     def add_route(self, *a, **kw): pass
@@ -339,30 +375,49 @@ class _MockApp:
 
 class _MockPromptServer:
     """
-    Minimal PromptServer stand-in that satisfies every attribute access
-    made by KJNodes, VideoHelperSuite, rgthree, and ComfyUI core nodes
-    when running headless (no aiohttp web server).
+    Complete headless PromptServer stand-in.
+    Provides every attribute accessed by any known ComfyUI custom node
+    at import time OR at runtime when running without a web server.
+
+    Attributes required by each custom node:
+      .app.router.frozen        — KJNodes  (__init__.py)
+      .routes.get(path)         — ComfyUI-Manager, rgthree, WhatDreamsCost, LTXDirector
+      .routes.post(path)        — same as above
+      .prompt_queue             — VideoHelperSuite (utils.py)
+      .last_node_id             — VideoHelperSuite (latent_preview.py at runtime)
+      .send_sync(event, data)   — SamplerCustomAdvanced preview callback
+      .node_replace_manager     — nodes_replacements.py
+      .client_id, .loop, etc.   — general ComfyUI internals
     """
     instance = None
 
     def __init__(self):
-        self.app            = _MockApp()
-        self.loop           = asyncio.new_event_loop()
-        self.messages       = asyncio.Queue()
-        self.client_id      = None
-        self.last_node_id   = None          # VideoHelperSuite latent_preview
-        self.last_prompt_id = None
-        self.queue          = None
-        self.number         = 0
-        self.node_paths     = {}
-        self.node_replace_manager = None    # nodes_replacements.py
+        self.app                  = _MockApp()
+        self.routes               = _MockRoutes()   # ComfyUI-Manager / rgthree / WDC
+        self.loop                 = asyncio.new_event_loop()
+        self.messages             = asyncio.Queue()
+        self.client_id            = None
+        self.last_node_id         = None            # VideoHelperSuite latent_preview
+        self.last_prompt_id       = None
+        self.prompt_queue         = _MockQueue()    # VideoHelperSuite utils.py
+        self.queue                = self.prompt_queue
+        self.number               = 0
+        self.node_paths           = {}
+        self.node_replace_manager = _MockNodeReplaceManager()  # nodes_replacements.py
+        self.supports_binary_preview = False
 
-    # ComfyUI calls this during sampling for live previews — we just ignore it
     def send_sync(self, event, data, sid=None):
+        """No-op: ComfyUI calls this during sampling for live UI previews."""
         pass
 
     def trigger_on_prompt(self, *a, **kw):
         pass
+
+    def add_on_prompt_handler(self, handler):
+        pass
+
+    def get_queue_info(self):
+        return {"queue_remaining": 0}
 
 def setup_comfyui():
     """Add ComfyUI to sys.path and install the headless PromptServer mock."""
